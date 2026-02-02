@@ -1,0 +1,278 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub provider: String,
+    pub model: String,
+    pub plan_mode: bool,
+    
+    /// Custom base URL for OpenAI-compatible APIs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    
+    /// Available models per provider (customizable)
+    #[serde(default)]
+    pub models: ModelsConfig,
+    
+    /// Auto-approve these tools without prompting
+    #[serde(default)]
+    pub auto_approve: AutoApproveConfig,
+    
+    // API keys for various providers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gemini_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groq_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub together_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    #[serde(default = "default_gemini_models")]
+    pub gemini: Vec<String>,
+    #[serde(default = "default_anthropic_models")]
+    pub anthropic: Vec<String>,
+    #[serde(default = "default_openai_models")]
+    pub openai: Vec<String>,
+    #[serde(default = "default_groq_models")]
+    pub groq: Vec<String>,
+    #[serde(default = "default_together_models")]
+    pub together: Vec<String>,
+    #[serde(default = "default_openrouter_models")]
+    pub openrouter: Vec<String>,
+}
+
+fn default_gemini_models() -> Vec<String> {
+    vec![
+        "gemini-2.5-flash".into(),
+        "gemini-2.5-pro".into(),
+        "gemini-2.0-flash".into(),
+        "gemini-3-pro-preview".into(),
+        "gemini-3-flash-preview".into(),
+    ]
+}
+
+fn default_anthropic_models() -> Vec<String> {
+    vec![
+        "claude-sonnet-4-20250514".into(),
+        "claude-opus-4-20250514".into(),
+        "claude-haiku-4-20250514".into(),
+    ]
+}
+
+fn default_openai_models() -> Vec<String> {
+    vec![
+        "gpt-4o".into(),
+        "gpt-4o-mini".into(),
+        "gpt-4.1".into(),
+        "o3-mini".into(),
+    ]
+}
+
+fn default_groq_models() -> Vec<String> {
+    vec![
+        "llama-3.3-70b-versatile".into(),
+        "llama-3-groq-70b-tool-use".into(),
+        "llama-3.1-8b-instant".into(),
+    ]
+}
+
+fn default_together_models() -> Vec<String> {
+    vec![
+        "Qwen/Qwen2.5-Coder-32B-Instruct".into(),
+        "deepseek-ai/DeepSeek-R1".into(),
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+    ]
+}
+
+fn default_openrouter_models() -> Vec<String> {
+    vec![
+        "anthropic/claude-sonnet-4.5".into(),
+        "openai/gpt-4o".into(),
+        "deepseek/deepseek-r1".into(),
+    ]
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            gemini: default_gemini_models(),
+            anthropic: default_anthropic_models(),
+            openai: default_openai_models(),
+            groq: default_groq_models(),
+            together: default_together_models(),
+            openrouter: default_openrouter_models(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoApproveConfig {
+    /// Auto-approve read operations (read_file, list_files, search_files, etc.)
+    #[serde(default = "default_true")]
+    pub read_operations: bool,
+    
+    /// Auto-approve write operations (write_to_file, replace_in_file)
+    #[serde(default)]
+    pub write_operations: bool,
+    
+    /// Auto-approve command execution
+    #[serde(default)]
+    pub commands: bool,
+    
+    /// Specific tools to always auto-approve
+    #[serde(default)]
+    pub tools: HashSet<String>,
+    
+    /// Command patterns to auto-approve (regex)
+    #[serde(default)]
+    pub command_patterns: Vec<String>,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for AutoApproveConfig {
+    fn default() -> Self {
+        Self {
+            read_operations: true,  // Auto-approve reads by default
+            write_operations: false,
+            commands: false,
+            tools: HashSet::new(),
+            command_patterns: Vec::new(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            provider: "gemini".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            plan_mode: false,
+            base_url: None,
+            models: ModelsConfig::default(),
+            auto_approve: AutoApproveConfig::default(),
+            gemini_api_key: None,
+            anthropic_api_key: None,
+            openai_api_key: None,
+            groq_api_key: None,
+            together_api_key: None,
+            openrouter_api_key: None,
+        }
+    }
+}
+
+impl Config {
+    pub fn load() -> Result<Self> {
+        let config_path = Self::config_path()?;
+        
+        let mut config = if config_path.exists() {
+            let contents = std::fs::read_to_string(&config_path)?;
+            serde_json::from_str(&contents).unwrap_or_default()
+        } else {
+            Self::default()
+        };
+
+        // Override with environment variables
+        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            config.gemini_api_key = Some(key);
+        }
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            config.anthropic_api_key = Some(key);
+        }
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            config.openai_api_key = Some(key);
+        }
+
+        Ok(config)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let config_path = Self::config_path()?;
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = serde_json::to_string_pretty(self)?;
+        std::fs::write(config_path, contents)?;
+        Ok(())
+    }
+
+    fn config_path() -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+        Ok(home.join(".forge").join("config.json"))
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        match self.provider.as_str() {
+            "gemini" => self.gemini_api_key.as_deref(),
+            "anthropic" => self.anthropic_api_key.as_deref(),
+            "openai" => self.openai_api_key.as_deref(),
+            "groq" => self.groq_api_key.as_deref(),
+            "together" => self.together_api_key.as_deref(),
+            "openrouter" => self.openrouter_api_key.as_deref(),
+            _ => None,
+        }
+    }
+    
+    /// Get the base URL for OpenAI-compatible APIs
+    pub fn api_base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+    
+    /// Get available models for a provider
+    pub fn get_models(&self, provider: &str) -> &[String] {
+        match provider {
+            "gemini" => &self.models.gemini,
+            "anthropic" => &self.models.anthropic,
+            "openai" => &self.models.openai,
+            "groq" => &self.models.groq,
+            "together" => &self.models.together,
+            "openrouter" => &self.models.openrouter,
+            _ => &self.models.gemini,
+        }
+    }
+
+    /// Check if a tool should be auto-approved
+    pub fn should_auto_approve(&self, tool_name: &str) -> bool {
+        // Specific tool override
+        if self.auto_approve.tools.contains(tool_name) {
+            return true;
+        }
+
+        // Category-based approval
+        match tool_name {
+            // Read operations
+            "read_file" | "list_files" | "search_files" | "codebase_search" 
+            | "list_code_definition_names" | "get_symbol_definition" 
+            | "find_symbol_references" | "web_search" | "web_fetch" => {
+                self.auto_approve.read_operations
+            }
+            
+            // Write operations
+            "write_to_file" | "replace_in_file" | "apply_patch" => {
+                self.auto_approve.write_operations
+            }
+            
+            // Commands
+            "execute_command" => {
+                self.auto_approve.commands
+            }
+            
+            // Always auto-approve these
+            "attempt_completion" | "ask_followup_question" 
+            | "plan_mode_respond" | "act_mode_respond" | "focus_chain" => true,
+            
+            _ => false,
+        }
+    }
+}
