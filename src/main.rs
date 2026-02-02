@@ -4,11 +4,13 @@ mod config;
 mod context;
 mod context7;
 mod repomap;
+mod session;
 mod setup;
 mod tools;
 mod tui;
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -43,6 +45,14 @@ struct Cli {
     /// Auto-approve all tool calls (YOLO mode)
     #[arg(long)]
     yolo: bool,
+    
+    /// Resume the last session for this directory
+    #[arg(long)]
+    resume: bool,
+    
+    /// Resume a specific session by ID
+    #[arg(long)]
+    session: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +83,24 @@ enum Commands {
         /// Setting to change (e.g., auto-approve.write_operations=true)
         setting: Option<String>,
     },
+    
+    /// List or manage saved sessions
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List all saved sessions
+    List,
+    /// Resume a specific session
+    Resume { id: String },
+    /// Delete a session
+    Delete { id: String },
+    /// Clear all sessions
+    Clear,
 }
 
 #[tokio::main]
@@ -132,8 +160,23 @@ async fn main() -> Result<()> {
     let mut ckpt = checkpoint::CheckpointManager::new(&workdir)?;
     ckpt.create("forge-session-start")?;
 
-    // Create agent
-    let mut agent = api::Agent::new(cfg, workdir.clone()).await?;
+    // Create or resume agent
+    let mut agent = if let Some(session_id) = cli.session {
+        // Resume specific session
+        println!("📂 Resuming session {}...", session_id);
+        api::Agent::resume(cfg, workdir.clone(), &session_id).await?
+    } else if cli.resume {
+        // Resume latest session for this workdir
+        if let Some(agent) = api::Agent::resume_latest(cfg.clone(), workdir.clone()).await? {
+            println!("📂 Resuming previous session ({} messages)", agent.messages.len());
+            agent
+        } else {
+            println!("No previous session found, starting new");
+            api::Agent::new(cfg, workdir.clone()).await?
+        }
+    } else {
+        api::Agent::new(cfg, workdir.clone()).await?
+    };
 
     // If prompt provided, run single-shot mode
     if let Some(prompt) = cli.prompt {
@@ -233,6 +276,49 @@ fn handle_command(cmd: Commands, workdir: &std::path::Path) -> Result<()> {
                 println!("    read_operations: {}", cfg.auto_approve.read_operations);
                 println!("    write_operations: {}", cfg.auto_approve.write_operations);
                 println!("    commands: {}", cfg.auto_approve.commands);
+            }
+        }
+        Commands::Sessions { action } => {
+            match action.unwrap_or(SessionAction::List) {
+                SessionAction::List => {
+                    let sessions = session::Session::list()?;
+                    if sessions.is_empty() {
+                        println!("No saved sessions");
+                    } else {
+                        println!("Saved sessions:");
+                        for s in sessions {
+                            let age = Utc::now() - s.updated_at;
+                            let age_str = if age.num_days() > 0 {
+                                format!("{}d ago", age.num_days())
+                            } else if age.num_hours() > 0 {
+                                format!("{}h ago", age.num_hours())
+                            } else {
+                                format!("{}m ago", age.num_minutes())
+                            };
+                            println!("  {} │ {} │ {} msgs │ {}",
+                                s.id,
+                                truncate(&s.title, 40),
+                                s.message_count,
+                                age_str
+                            );
+                        }
+                        println!("\nResume with: forge --session <ID>");
+                    }
+                }
+                SessionAction::Resume { id } => {
+                    println!("Use: forge --session {}", id);
+                }
+                SessionAction::Delete { id } => {
+                    session::Session::delete(&id)?;
+                    println!("✓ Deleted session {}", id);
+                }
+                SessionAction::Clear => {
+                    let sessions = session::Session::list()?;
+                    for s in sessions {
+                        session::Session::delete(&s.id)?;
+                    }
+                    println!("✓ Cleared all sessions");
+                }
             }
         }
     }

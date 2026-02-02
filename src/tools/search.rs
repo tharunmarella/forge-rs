@@ -28,6 +28,39 @@ pub fn init_embedding_provider(provider: &str, api_key: Option<&str>, base_url: 
     }
 }
 
+/// Start background indexing of workspace (call on startup)
+pub fn start_background_indexing(workdir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        // Get configured provider or default to Voyage
+        let provider = get_provider_config()
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or(EmbeddingProvider::Voyage);
+
+        match EmbeddingStore::new(provider) {
+            Ok(store) => {
+                tracing::info!("Starting background workspace indexing...");
+                match store.index_workspace(&workdir).await {
+                    Ok(count) => {
+                        tracing::info!("Indexed {} code chunks", count);
+                        // Store in global
+                        let store_lock = get_store();
+                        let mut guard = store_lock.write().await;
+                        *guard = Some(store);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Background indexing failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create embedding store: {}", e);
+            }
+        }
+    });
+}
+
 /// Grep search using regex
 pub async fn grep(args: &Value, workdir: &Path) -> ToolResult {
     let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
@@ -248,4 +281,28 @@ fn is_binary_extension(name: &str) -> bool {
         ".wasm", ".o", ".a",
     ];
     binary_ext.iter().any(|ext| name.ends_with(ext))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn test_init_embedding_provider() {
+        // Test Anthropic -> Voyage
+        init_embedding_provider("anthropic", Some("test-key"), None);
+        let provider = get_provider_config().read().unwrap();
+        assert!(matches!(provider.as_ref(), Some(EmbeddingProvider::Voyage)));
+    }
+
+    #[tokio::test]
+    async fn test_background_indexing_starts() {
+        // Just verify it doesn't panic
+        let workdir = PathBuf::from("/tmp");
+        init_embedding_provider("gemini", Some("test"), None);
+        start_background_indexing(workdir);
+        // Give it a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

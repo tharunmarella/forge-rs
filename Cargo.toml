@@ -51,7 +51,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 similar = "2"  # For diff generation
 shellexpand = "3"

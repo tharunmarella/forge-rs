@@ -190,6 +190,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
         }
 
         if app.should_quit {
+            // Save session before exiting
+            app.agent.save_session().ok();
             break;
         }
     }
@@ -428,6 +430,9 @@ async fn send_message(
 
     // Process any pending tools
     process_remaining_tools(terminal, app).await?;
+
+    // Auto-save session after each interaction
+    app.agent.save_session().ok();
 
     Ok(())
 }

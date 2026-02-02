@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::context7::DocPrefetcher;
 use crate::repomap::RepoMap;
+use crate::session::Session;
 use crate::tools::{self, ToolCall, ToolResult};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,7 @@ pub struct Agent {
     pub messages: Vec<Message>,
     doc_prefetcher: DocPrefetcher,
     repo_map: String,
+    session: Option<Session>,
 }
 
 impl Agent {
@@ -60,6 +62,12 @@ impl Agent {
             config.base_url.as_deref(),
         );
         
+        // Start background indexing
+        tools::start_background_indexing(workdir.clone());
+        
+        // Create new session
+        let session = Session::new(workdir.clone(), &config.provider, &config.model);
+        
         Ok(Self {
             config,
             workdir,
@@ -67,7 +75,64 @@ impl Agent {
             messages: Vec::new(),
             doc_prefetcher: DocPrefetcher::new(),
             repo_map,
+            session: Some(session),
         })
+    }
+    
+    /// Create agent and resume from a previous session
+    pub async fn resume(config: Config, workdir: PathBuf, session_id: &str) -> Result<Self> {
+        let context = Context::new(&workdir).await?;
+        
+        // Build repo map
+        let mut repo_map_builder = RepoMap::new(workdir.clone(), 1024);
+        let repo_map = repo_map_builder.build_from_directory();
+        
+        // Initialize embedding provider
+        tools::init_embedding_provider(
+            &config.provider,
+            config.api_key().as_deref(),
+            config.base_url.as_deref(),
+        );
+        
+        // Start background indexing
+        tools::start_background_indexing(workdir.clone());
+        
+        // Load existing session
+        let session = Session::load(session_id)?;
+        let messages = session.messages.clone();
+        
+        Ok(Self {
+            config,
+            workdir,
+            context,
+            messages,
+            doc_prefetcher: DocPrefetcher::new(),
+            repo_map,
+            session: Some(session),
+        })
+    }
+    
+    /// Resume the latest session for this workdir
+    pub async fn resume_latest(config: Config, workdir: PathBuf) -> Result<Option<Self>> {
+        if let Some(session) = Session::load_latest(&workdir)? {
+            let agent = Self::resume(config, workdir, &session.id).await?;
+            Ok(Some(agent))
+        } else {
+            Ok(None)
+        }
+    }
+    
+    /// Save current session
+    pub fn save_session(&mut self) -> Result<()> {
+        if let Some(ref mut session) = self.session {
+            session.update(&self.messages)?;
+        }
+        Ok(())
+    }
+    
+    /// Get session ID
+    pub fn session_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.id.as_str())
     }
 
     /// Run a single prompt with streaming output
@@ -150,6 +215,8 @@ impl Agent {
                 }
                 AgentResponse::Completion(result) => {
                     println!("\n\x1b[32m✅ {result}\x1b[0m");
+                    // Save session on completion
+                    self.save_session().ok();
                     break;
                 }
                 AgentResponse::Question(q) => {
