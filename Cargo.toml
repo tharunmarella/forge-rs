@@ -43,6 +43,9 @@ fastembed = "4"
 # Git operations (no SSH/HTTPS to avoid OpenSSL dependency)
 git2 = { version = "0.19", default-features = false }
 
+# OpenSSL (vendored to avoid system dependency issues in CI)
+openssl = { version = "0.10", features = ["vendored"] }
+
 # Utils
 anyhow = "1"
 thiserror = "2"
