@@ -1,0 +1,34 @@
+{
+  "name": "forge-cli-rs",
+  "version": "0.1.0",
+  "description": "Terminal-first AI coding agent - Rust edition",
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "terminal",
+    "cli",
+    "rust",
+    "claude",
+    "gemini",
+    "gpt",
+    "llm"
+  ],
+  "license": "MIT",
+  "author": "Forge Team",
+  "bin": {
+    "forge": "./bin/forge"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}
