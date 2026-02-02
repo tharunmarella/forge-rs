@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Terminal-first AI coding agent"
 license = "MIT"
+repository = "https://github.com/tharunmarella/forge-rs"
 
 [dependencies]
 # Async runtime
@@ -69,3 +70,8 @@ path = "src/main.rs"
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
