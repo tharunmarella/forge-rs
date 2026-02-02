@@ -38,9 +38,6 @@ tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.23"
 
-# Embeddings & vector search
-fastembed = "4"
-
 # Git operations (no SSH/HTTPS to avoid OpenSSL dependency)
 git2 = { version = "0.19", default-features = false }
 
@@ -59,6 +56,7 @@ regex = "1"
 similar = "2"  # For diff generation
 shellexpand = "3"
 urlencoding = "2"
+petgraph = "0.6"  # For PageRank graph algorithm
 
 # Markdown rendering
 termimad = "0.30"

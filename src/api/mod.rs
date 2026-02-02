@@ -8,6 +8,7 @@ pub use streaming::{StreamEvent, StreamReceiver};
 use crate::config::Config;
 use crate::context::Context;
 use crate::context7::DocPrefetcher;
+use crate::repomap::RepoMap;
 use crate::tools::{self, ToolCall, ToolResult};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -41,11 +42,23 @@ pub struct Agent {
     context: Context,
     pub messages: Vec<Message>,
     doc_prefetcher: DocPrefetcher,
+    repo_map: String,
 }
 
 impl Agent {
     pub async fn new(config: Config, workdir: PathBuf) -> Result<Self> {
         let context = Context::new(&workdir).await?;
+        
+        // Build repo map on startup (1024 token budget)
+        let mut repo_map_builder = RepoMap::new(workdir.clone(), 1024);
+        let repo_map = repo_map_builder.build_from_directory();
+        
+        // Initialize embedding provider based on LLM provider
+        tools::init_embedding_provider(
+            &config.provider,
+            config.api_key().as_deref(),
+            config.base_url.as_deref(),
+        );
         
         Ok(Self {
             config,
@@ -53,6 +66,7 @@ impl Agent {
             context,
             messages: Vec::new(),
             doc_prefetcher: DocPrefetcher::new(),
+            repo_map,
         })
     }
 
@@ -181,12 +195,25 @@ impl Agent {
         // Get any prefetched documentation
         let prefetched_docs = self.doc_prefetcher.get_cached_docs_for_prompt();
         
+        // Include repo map if available
+        let repo_map_section = if !self.repo_map.is_empty() {
+            format!(r#"
+# Codebase Map
+The following shows key symbols and their locations in the codebase:
+```
+{}
+```
+"#, self.repo_map.trim())
+        } else {
+            String::new()
+        };
+        
         format!(r#"You are Forge, a CLI coding agent. Mode: {mode}
 
 # Environment
 - Working directory: {}
 - Files: {}
-
+{repo_map_section}
 # Tools
 You have access to tools for file operations, code search, and web access.
 Use tools to accomplish tasks. Always read files before editing.
@@ -214,10 +241,17 @@ Use tools to accomplish tasks. Always read files before editing.
     pub fn messages(&self) -> &[Message] { &self.messages }
     pub fn workdir(&self) -> &PathBuf { &self.workdir }
     pub fn doc_prefetcher(&self) -> &DocPrefetcher { &self.doc_prefetcher }
+    pub fn repo_map(&self) -> &str { &self.repo_map }
     
     /// Trigger doc prefetch for a query (called from TUI)
     pub fn prefetch_docs(&self, query: &str) {
         self.doc_prefetcher.prefetch_async(query.to_string());
+    }
+    
+    /// Rebuild repo map (call after file changes)
+    pub fn refresh_repo_map(&mut self) {
+        let mut builder = RepoMap::new(self.workdir.clone(), 1024);
+        self.repo_map = builder.build_from_directory();
     }
 }
 

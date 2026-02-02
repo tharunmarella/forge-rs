@@ -3,6 +3,7 @@ mod checkpoint;
 mod config;
 mod context;
 mod context7;
+mod repomap;
 mod setup;
 mod tools;
 mod tui;
@@ -242,4 +243,15 @@ fn handle_command(cmd: Commands, workdir: &std::path::Path) -> Result<()> {
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } 
     else { format!("{}...", &s[..max]) }
+}
+
+// Test function for repo-map
+#[allow(dead_code)]
+fn test_repo_map() {
+    use std::path::PathBuf;
+    let root = PathBuf::from(".");
+    let mut rm = repomap::RepoMap::new(root, 1024);
+    let map = rm.build_from_directory();
+    println!("=== REPO MAP ({} chars) ===", map.len());
+    println!("{}", map);
 }

@@ -1,17 +1,31 @@
-use super::embeddings::EmbeddingStore;
+use super::embeddings::{EmbeddingProvider, EmbeddingStore};
 use super::ToolResult;
 use regex::Regex;
 use serde_json::Value;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 use walkdir::WalkDir;
 
 // Global embedding store (lazy initialized)
 static EMBEDDING_STORE: OnceLock<RwLock<Option<EmbeddingStore>>> = OnceLock::new();
+// Global embedding provider config (set once on startup)
+static EMBEDDING_PROVIDER: OnceLock<StdRwLock<Option<EmbeddingProvider>>> = OnceLock::new();
 
 fn get_store() -> &'static RwLock<Option<EmbeddingStore>> {
     EMBEDDING_STORE.get_or_init(|| RwLock::new(None))
+}
+
+fn get_provider_config() -> &'static StdRwLock<Option<EmbeddingProvider>> {
+    EMBEDDING_PROVIDER.get_or_init(|| StdRwLock::new(None))
+}
+
+/// Initialize embedding provider from LLM config (call once at startup)
+pub fn init_embedding_provider(provider: &str, api_key: Option<&str>, base_url: Option<&str>) {
+    let embedding_provider = EmbeddingProvider::from_config(provider, api_key, base_url);
+    if let Ok(mut guard) = get_provider_config().write() {
+        *guard = Some(embedding_provider);
+    }
 }
 
 /// Grep search using regex
@@ -96,7 +110,14 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
     
     // Initialize embedding store if needed
     if store_guard.is_none() {
-        match EmbeddingStore::new() {
+        // Get configured provider or default to Voyage
+        let provider = get_provider_config()
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or(EmbeddingProvider::Voyage);
+        
+        match EmbeddingStore::new(provider) {
             Ok(store) => {
                 // Index workspace in background
                 if let Err(e) = store.index_workspace(workdir).await {

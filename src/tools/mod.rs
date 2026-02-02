@@ -7,7 +7,7 @@ mod embeddings;
 mod treesitter;
 pub mod ide;
 
-pub use embeddings::EmbeddingStore;
+pub use embeddings::{EmbeddingProvider, EmbeddingStore};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
