@@ -40,8 +40,8 @@ tree-sitter-go = "0.23"
 # Embeddings & vector search
 fastembed = "4"
 
-# Git operations
-git2 = "0.19"
+# Git operations (no SSH/HTTPS to avoid OpenSSL dependency)
+git2 = { version = "0.19", default-features = false }
 
 # Utils
 anyhow = "1"
