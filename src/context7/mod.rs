@@ -251,3 +251,28 @@ mod tests {
         assert!(!prefetcher.is_relevant("cooking recipes", "React"));
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_search_and_fetch() {
+        let prefetcher = DocPrefetcher::new();
+        
+        // Directly call search_and_fetch (not async prefetch)
+        let result = prefetcher.search_and_fetch("React hooks").await;
+        assert!(result.is_ok(), "Search should succeed");
+        
+        // Give it a moment to populate cache
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        
+        // Check if docs were cached
+        let docs = prefetcher.get_cached_docs_for_prompt();
+        println!("Cached docs length: {} chars", docs.len());
+        println!("Preview: {}...", &docs[..docs.len().min(500)]);
+        
+        assert!(!docs.is_empty(), "Should have cached docs");
+        assert!(docs.contains("<prefetched_documentation>"), "Should have doc wrapper");
+    }
+}
