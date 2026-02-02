@@ -1,5 +1,5 @@
 {
-  "name": "forge-cli-rs",
+  "name": "codeforge-cli",
   "version": "0.1.0",
   "description": "Terminal-first AI coding agent - Rust edition",
   "keywords": [
