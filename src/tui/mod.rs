@@ -58,6 +58,9 @@ pub struct App {
     should_quit: bool,
     
     agent_rx: Option<mpsc::Receiver<AgentEvent>>,
+    
+    /// Session-only auto-approve all tools (reset on restart)
+    session_yolo: bool,
 }
 
 #[derive(Clone)]
@@ -110,6 +113,7 @@ impl App {
             is_thinking: false,
             should_quit: false,
             agent_rx: None,
+            session_yolo: false,
         }
     }
 
@@ -256,6 +260,11 @@ async fn handle_key_event(
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 // Execute the approved tool
+                execute_pending_tool(terminal, app, pending.tool, pending.idx).await?;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Yes to ALL - enable session yolo mode
+                app.session_yolo = true;
                 execute_pending_tool(terminal, app, pending.tool, pending.idx).await?;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -497,9 +506,13 @@ async fn process_remaining_tools(
         let call = app.pending_tools[app.current_tool_idx].clone();
         let idx = app.current_tool_idx;
         
-        let approved = app.agent.config.should_auto_approve(&call.name);
+        // Check session yolo OR config auto-approve
+        let approved = app.session_yolo || app.agent.config.should_auto_approve(&call.name);
         
         if !approved {
+            // Show diff preview in IDE for file-modifying tools
+            preview_tool_diff(&call, app.agent.workdir());
+            
             app.pending_approval = Some(PendingApproval { tool: call, idx });
             return Ok(()); // Wait for user input
         }
@@ -575,6 +588,48 @@ async fn execute_pending_tool(
     app.current_tool_idx += 1;
     
     Ok(())
+}
+
+/// Show diff preview in IDE for file-modifying tools (before approval)
+fn preview_tool_diff(tool: &ToolCall, workdir: &std::path::Path) {
+    use crate::tools::ide;
+    
+    let name = tool.name.as_str();
+    let args = &tool.arguments;
+    
+    match name {
+        "write_to_file" => {
+            if let (Some(path), Some(content)) = (
+                args.get("path").and_then(|v| v.as_str()),
+                args.get("content").and_then(|v| v.as_str())
+            ) {
+                let full_path = workdir.join(path);
+                let old_content = std::fs::read_to_string(&full_path).unwrap_or_default();
+                ide::show_diff_in_ide(&full_path, &old_content, content);
+            }
+        }
+        "replace_in_file" => {
+            if let (Some(path), Some(old_str), Some(new_str)) = (
+                args.get("path").and_then(|v| v.as_str()),
+                args.get("old_str").and_then(|v| v.as_str()),
+                args.get("new_str").and_then(|v| v.as_str())
+            ) {
+                let full_path = workdir.join(path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    let new_content = content.replacen(old_str, new_str, 1);
+                    ide::show_diff_in_ide(&full_path, &content, &new_content);
+                }
+            }
+        }
+        "apply_patch" => {
+            // For patches, just show the file that will be modified
+            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                let full_path = workdir.join(path);
+                ide::open_file_in_ide(&full_path, None);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn get_completion(agent: &Agent) -> Result<AgentResponse> {
@@ -864,8 +919,8 @@ fn draw_command_palette(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_approval_dialog(f: &mut Frame, pending: &PendingApproval, area: Rect) {
-    let width = 50.min(area.width - 4);
-    let height = 5;
+    let width = 60.min(area.width - 4);
+    let height = 6;
     let x = (area.width - width) / 2;
     let y = (area.height - height) / 2;
 
@@ -879,12 +934,16 @@ fn draw_approval_dialog(f: &mut Frame, pending: &PendingApproval, area: Rect) {
 
     let content = vec![
         Line::from(""),
+        Line::from(Span::styled("  Diff preview opened in IDE", Style::default().fg(DIM))),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("     [", Style::default().fg(DIM)),
+            Span::styled("  [", Style::default().fg(DIM)),
             Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("] approve    [", Style::default().fg(DIM)),
+            Span::styled("] yes  [", Style::default().fg(DIM)),
             Span::styled("n", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-            Span::styled("] reject", Style::default().fg(DIM)),
+            Span::styled("] no  [", Style::default().fg(DIM)),
+            Span::styled("a", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled("] yes to all (session)", Style::default().fg(DIM)),
         ]),
     ];
 
