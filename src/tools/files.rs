@@ -1,4 +1,5 @@
 use super::ToolResult;
+use super::ide;
 use serde_json::Value;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -57,6 +58,9 @@ pub async fn write(args: &Value, workdir: &Path) -> ToolResult {
 
     let full_path = workdir.join(path);
 
+    // Read old content for diff (if file exists)
+    let old_content = std::fs::read_to_string(&full_path).ok();
+
     // Create parent directories
     if let Some(parent) = full_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -65,7 +69,16 @@ pub async fn write(args: &Value, workdir: &Path) -> ToolResult {
     }
 
     match std::fs::write(&full_path, content) {
-        Ok(_) => ToolResult::ok(format!("Created {path} ({} bytes)", content.len())),
+        Ok(_) => {
+            // Show diff in IDE if file was modified (not new)
+            if let Some(old) = old_content {
+                ide::show_diff_in_ide(&full_path, &old, content);
+            } else {
+                // New file - just open it
+                ide::open_file_in_ide(&full_path, None);
+            }
+            ToolResult::ok(format!("Created {path} ({} bytes)", content.len()))
+        }
         Err(e) => ToolResult::err(format!("Failed to write: {e}")),
     }
 }
@@ -107,7 +120,11 @@ pub async fn replace(args: &Value, workdir: &Path) -> ToolResult {
     let new_content = content.replacen(old_str, new_str, 1);
 
     match std::fs::write(&full_path, &new_content) {
-        Ok(_) => ToolResult::ok(format!("Updated {path}")),
+        Ok(_) => {
+            // Show diff in IDE if available
+            ide::show_diff_in_ide(&full_path, &content, &new_content);
+            ToolResult::ok(format!("Updated {path}"))
+        }
         Err(e) => ToolResult::err(format!("Failed to write: {e}")),
     }
 }
@@ -134,6 +151,8 @@ pub async fn apply_patch(args: &Value, workdir: &Path) -> ToolResult {
             if let Err(e) = std::fs::write(&full_path, &new_content) {
                 return ToolResult::err(format!("Failed to write: {e}"));
             }
+            // Show diff in IDE
+            ide::show_diff_in_ide(&full_path, &content, &new_content);
             ToolResult::ok(format!("Patched {path}"))
         }
         Err(e) => ToolResult::err(format!("Failed to apply patch: {e}")),

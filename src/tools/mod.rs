@@ -5,6 +5,7 @@ mod code;
 mod web;
 mod embeddings;
 mod treesitter;
+pub mod ide;
 
 pub use embeddings::EmbeddingStore;
 
