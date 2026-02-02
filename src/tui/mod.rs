@@ -394,6 +394,9 @@ async fn send_message(
     app: &mut App, 
     prompt: &str
 ) -> Result<()> {
+    // Start background doc prefetch for this query (Context7)
+    app.agent.prefetch_docs(prompt);
+    
     // Add user message
     app.messages.push(ChatMessage {
         role: ChatRole::User,
@@ -635,6 +638,9 @@ fn preview_tool_diff(tool: &ToolCall, workdir: &std::path::Path) {
 async fn get_completion(agent: &Agent) -> Result<AgentResponse> {
     use crate::api::{gemini, anthropic, openai};
     
+    // Get any prefetched documentation from Context7
+    let prefetched_docs = agent.doc_prefetcher().get_cached_docs_for_prompt();
+    
     let system_prompt = format!(
         "You are Forge, a terminal-first AI coding agent.\n\
          Mode: {} ({})\n\
@@ -643,10 +649,12 @@ async fn get_completion(agent: &Agent) -> Result<AgentResponse> {
          - Be concise and direct\n\
          - Use tools to complete tasks\n\
          - Always use attempt_completion when done\n\
-         - Read files before editing them",
+         - Read files before editing them\n\
+         {}",
         if agent.config.plan_mode { "PLAN" } else { "ACT" },
         if agent.config.plan_mode { "read-only, no modifications" } else { "full access" },
-        agent.workdir().display()
+        agent.workdir().display(),
+        prefetched_docs
     );
     let tool_defs = tools::definitions(agent.config.plan_mode);
 

@@ -7,6 +7,7 @@ pub use streaming::{StreamEvent, StreamReceiver};
 
 use crate::config::Config;
 use crate::context::Context;
+use crate::context7::DocPrefetcher;
 use crate::tools::{self, ToolCall, ToolResult};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ pub struct Agent {
     workdir: PathBuf,
     context: Context,
     pub messages: Vec<Message>,
+    doc_prefetcher: DocPrefetcher,
 }
 
 impl Agent {
@@ -50,12 +52,16 @@ impl Agent {
             workdir,
             context,
             messages: Vec::new(),
+            doc_prefetcher: DocPrefetcher::new(),
         })
     }
 
     /// Run a single prompt with streaming output
     pub async fn run_prompt(&mut self, prompt: &str) -> Result<()> {
         println!("📝 Task: {prompt}\n");
+
+        // Start background doc prefetch for this query
+        self.doc_prefetcher.prefetch_async(prompt.to_string());
 
         self.messages.push(Message {
             role: Role::User,
@@ -172,6 +178,9 @@ impl Agent {
     fn build_system_prompt(&self) -> String {
         let mode = if self.config.plan_mode { "PLAN" } else { "ACT" };
         
+        // Get any prefetched documentation
+        let prefetched_docs = self.doc_prefetcher.get_cached_docs_for_prompt();
+        
         format!(r#"You are Forge, a CLI coding agent. Mode: {mode}
 
 # Environment
@@ -189,6 +198,7 @@ Use tools to accomplish tasks. Always read files before editing.
 4. Use attempt_completion when done
 5. Ask clarifying questions if needed
 
+{}
 {}"#,
             self.workdir.display(),
             self.context.file_summary(),
@@ -196,12 +206,19 @@ Use tools to accomplish tasks. Always read files before editing.
                 "In PLAN mode: read-only, no file modifications allowed."
             } else {
                 "In ACT mode: you can read and modify files."
-            }
+            },
+            prefetched_docs
         )
     }
 
     pub fn messages(&self) -> &[Message] { &self.messages }
     pub fn workdir(&self) -> &PathBuf { &self.workdir }
+    pub fn doc_prefetcher(&self) -> &DocPrefetcher { &self.doc_prefetcher }
+    
+    /// Trigger doc prefetch for a query (called from TUI)
+    pub fn prefetch_docs(&self, query: &str) {
+        self.doc_prefetcher.prefetch_async(query.to_string());
+    }
 }
 
 pub enum AgentResponse {

@@ -58,6 +58,7 @@ chrono = "0.4"
 regex = "1"
 similar = "2"  # For diff generation
 shellexpand = "3"
+urlencoding = "2"
 
 # Markdown rendering
 termimad = "0.30"

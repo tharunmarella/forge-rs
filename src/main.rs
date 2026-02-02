@@ -2,6 +2,7 @@ mod api;
 mod checkpoint;
 mod config;
 mod context;
+mod context7;
 mod setup;
 mod tools;
 mod tui;
