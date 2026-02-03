@@ -118,20 +118,33 @@ async fn main() -> Result<()> {
     let start_time = std::time::Instant::now();
     let cli = Cli::parse();
 
-    // Initialize logging - INFO level shows timing, DEBUG shows everything
+    // Initialize logging
+    let is_tui_mode = cli.prompt.is_none();
     use tracing_subscriber::EnvFilter;
     let filter = if cli.verbose {
         EnvFilter::new("debug")
     } else {
-        // Show timing info (INFO) by default, override with RUST_LOG env
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("forge=info,warn"))
     };
     
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .init();
+    if is_tui_mode {
+        // TUI mode: log to file to avoid interfering with terminal
+        let log_file = std::fs::File::create("/tmp/forge.log").ok();
+        if let Some(file) = log_file {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_writer(file)
+                .init();
+        }
+    } else {
+        // CLI mode: log to stdout
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .without_time()
+            .init();
+    }
 
     // Expand workdir
     let workdir = shellexpand::tilde(&cli.workdir).to_string();

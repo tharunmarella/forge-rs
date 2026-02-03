@@ -6,6 +6,9 @@ description = "Terminal-first AI coding agent"
 license = "MIT"
 repository = "https://github.com/tharunmarella/forge-rs"
 
+[workspace]
+members = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -13,7 +16,10 @@ tokio = { version = "1", features = ["full"] }
 # CLI & TUI
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+termimad = "0.31"
+tui-textarea = { version = "0.4", features = ["crossterm"] }
+throbber-widgets-tui = "0.8"
 
 # HTTP & API
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -27,7 +33,7 @@ serde_json = "1"
 # File watching & operations
 notify = "7"
 walkdir = "2"
-ignore = "0.4"  # Respects .gitignore
+ignore = "0.4"
 grep = "0.3"
 
 # Code parsing
@@ -38,13 +44,13 @@ tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.23"
 
-# Git operations (no SSH/HTTPS to avoid OpenSSL dependency)
+# Git operations
 git2 = { version = "0.19", default-features = false }
 
-# OpenSSL (vendored to avoid system dependency issues in CI)
+# OpenSSL
 openssl = { version = "0.10", features = ["vendored"] }
 
-# Database for embeddings persistence
+# Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Utils
@@ -56,13 +62,10 @@ dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
-similar = "2"  # For diff generation
+similar = "2"
 shellexpand = "3"
 urlencoding = "2"
-petgraph = "0.6"  # For PageRank graph algorithm
-
-# Markdown rendering
-termimad = "0.30"
+petgraph = "0.6"
 
 [[bin]]
 name = "forge"
@@ -73,7 +76,6 @@ lto = true
 codegen-units = 1
 strip = true
 
-# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"

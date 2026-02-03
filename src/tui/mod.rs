@@ -1,4 +1,4 @@
-use crate::api::{Agent, AgentResponse, Message, Role};
+use crate::api::{Agent, Message, Role};
 use crate::checkpoint::CheckpointManager;
 use crate::tools::{self, ToolCall};
 use anyhow::Result;
@@ -11,12 +11,11 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, Stdout};
-use tokio::sync::mpsc;
 
 // Forge color palette
 const ORANGE: Color = Color::Indexed(208);
@@ -27,11 +26,29 @@ const DIM: Color = Color::Indexed(240);
 const GREEN: Color = Color::Indexed(34);
 const RED: Color = Color::Indexed(196);
 
-// Events from background agent task
-enum AgentEvent {
-    Response(Result<AgentResponse>),
-    ToolStarted(usize),
-    ToolFinished(usize, bool, u64),
+#[derive(Clone, PartialEq)]
+pub enum ChatRole { User, Assistant, System }
+
+#[derive(Clone)]
+pub struct ToolStatus {
+    name: String,
+    status: ToolState,
+    duration_ms: Option<u64>,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ToolState { Pending, Running, Success, Failed, Skipped }
+
+#[derive(Clone)]
+pub struct ChatMessage {
+    role: ChatRole,
+    content: String,
+    tools: Vec<ToolStatus>,
+}
+
+pub struct PendingApproval {
+    tool: ToolCall,
+    idx: usize,
 }
 
 pub struct App {
@@ -55,37 +72,10 @@ pub struct App {
     model_picker_selected: usize,
     
     is_thinking: bool,
+    thinking_count: usize,
     should_quit: bool,
     
-    agent_rx: Option<mpsc::Receiver<AgentEvent>>,
-    
-    /// Session-only auto-approve all tools (reset on restart)
     session_yolo: bool,
-}
-
-#[derive(Clone)]
-pub struct ChatMessage {
-    role: ChatRole,
-    content: String,
-    tools: Vec<ToolStatus>,
-}
-
-#[derive(Clone, PartialEq)]
-pub enum ChatRole { User, Assistant, System }
-
-#[derive(Clone)]
-pub struct ToolStatus {
-    name: String,
-    status: ToolState,
-    duration_ms: Option<u64>,
-}
-
-#[derive(Clone, PartialEq)]
-pub enum ToolState { Pending, Running, Success, Failed, Skipped }
-
-struct PendingApproval {
-    tool: ToolCall,
-    idx: usize,
 }
 
 const COMMANDS: &[&str] = &["Change model", "Ask mode", "Agent mode", "Undo", "Clear"];
@@ -111,8 +101,8 @@ impl App {
             model_picker_open: false,
             model_picker_selected: 0,
             is_thinking: false,
+            thinking_count: 0,
             should_quit: false,
-            agent_rx: None,
             session_yolo: false,
         }
     }
@@ -151,7 +141,6 @@ pub async fn run(agent: Agent) -> Result<()> {
 
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, session_start: std::time::Instant) -> Result<()> {
     loop {
-        // Check session timeout
         if let Some(timeout_secs) = app.agent.config.timeout {
             if session_start.elapsed().as_secs() >= timeout_secs {
                 app.messages.push(ChatMessage {
@@ -165,39 +154,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
             }
         }
 
-        // Draw UI
         terminal.draw(|f| draw_ui(f, app))?;
 
-        // Check for agent events (non-blocking)
-        if let Some(ref mut rx) = app.agent_rx {
-            match rx.try_recv() {
-                Ok(AgentEvent::Response(result)) => {
-                    app.is_thinking = false;
-                    handle_agent_response(app, result).await?;
-                }
-                Ok(AgentEvent::ToolStarted(idx)) => {
-                    if let Some(msg) = app.messages.last_mut() {
-                        if idx < msg.tools.len() {
-                            msg.tools[idx].status = ToolState::Running;
-                        }
-                    }
-                }
-                Ok(AgentEvent::ToolFinished(idx, success, duration)) => {
-                    if let Some(msg) = app.messages.last_mut() {
-                        if idx < msg.tools.len() {
-                            msg.tools[idx].status = if success { ToolState::Success } else { ToolState::Failed };
-                            msg.tools[idx].duration_ms = Some(duration);
-                        }
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    app.agent_rx = None;
-                }
-            }
+        if app.is_thinking {
+            app.thinking_count = app.thinking_count.wrapping_add(1);
         }
 
-        // Poll for keyboard events
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 handle_key_event(terminal, app, key).await?;
@@ -205,12 +167,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut Ap
         }
 
         if app.should_quit {
-            // Save session before exiting
             app.agent.save_session().ok();
             break;
         }
     }
-
     Ok(())
 }
 
@@ -219,7 +179,6 @@ async fn handle_key_event(
     app: &mut App, 
     key: event::KeyEvent
 ) -> Result<()> {
-    // Model picker
     if app.model_picker_open {
         let models = app.agent.config.get_models(&app.agent.config.provider);
         match key.code {
@@ -244,7 +203,6 @@ async fn handle_key_event(
         return Ok(());
     }
 
-    // Command palette
     if app.command_palette_open {
         match key.code {
             KeyCode::Esc => app.command_palette_open = false,
@@ -252,7 +210,7 @@ async fn handle_key_event(
             KeyCode::Down if app.command_palette_selected < COMMANDS.len() - 1 => app.command_palette_selected += 1,
             KeyCode::Enter => {
                 match app.command_palette_selected {
-                    0 => { // Change model
+                    0 => {
                         app.command_palette_open = false;
                         app.model_picker_open = true;
                         app.model_picker_selected = 0;
@@ -263,26 +221,23 @@ async fn handle_key_event(
                     4 => { app.messages.clear(); app.scroll = 0; }
                     _ => {}
                 }
-                if app.command_palette_selected != 0 {
-                    app.command_palette_open = false;
-                }
+                app.command_palette_open = false;
             }
             _ => {}
         }
         return Ok(());
     }
 
-    // Approval dialog
     if let Some(pending) = app.pending_approval.take() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Execute the approved tool
                 execute_pending_tool(terminal, app, pending.tool, pending.idx).await?;
+                process_remaining_tools(terminal, app).await?;
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                // Yes to ALL - enable session yolo mode
                 app.session_yolo = true;
                 execute_pending_tool(terminal, app, pending.tool, pending.idx).await?;
+                process_remaining_tools(terminal, app).await?;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 if let Some(msg) = app.messages.last_mut() {
@@ -290,7 +245,6 @@ async fn handle_key_event(
                         msg.tools[pending.idx].status = ToolState::Skipped;
                     }
                 }
-                // Continue with remaining tools or get next response
                 process_remaining_tools(terminal, app).await?;
             }
             _ => {
@@ -300,17 +254,12 @@ async fn handle_key_event(
         return Ok(());
     }
 
-    // Global shortcuts
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => app.should_quit = true,
             KeyCode::Char('k') => {
                 app.command_palette_open = true;
                 app.command_palette_selected = 0;
-            }
-            KeyCode::Char('m') => {
-                app.model_picker_open = true;
-                app.model_picker_selected = 0;
             }
             KeyCode::Char('z') => {
                 if let Some(ref ckpt) = app.checkpoint {
@@ -328,50 +277,13 @@ async fn handle_key_event(
         return Ok(());
     }
 
-    // Normal input
     match key.code {
         KeyCode::Enter if !app.input.is_empty() && !app.is_thinking => {
             let input = app.input.trim().to_string();
             app.input.clear();
             app.input_cursor = 0;
-            
-            // Handle slash commands
             if input.starts_with('/') {
-                match input.as_str() {
-                    "/model" | "/m" => {
-                        app.model_picker_open = true;
-                        app.model_picker_selected = 0;
-                    }
-                    "/undo" => {
-                        if let Some(ref ckpt) = app.checkpoint {
-                            if ckpt.undo().is_ok() {
-                                app.messages.push(ChatMessage {
-                                    role: ChatRole::System,
-                                    content: "Restored to previous checkpoint".to_string(),
-                                    tools: vec![],
-                                });
-                            }
-                        }
-                    }
-                    "/clear" => {
-                        app.messages.clear();
-                        app.scroll = 0;
-                    }
-                    "/help" | "/?" => {
-                        app.messages.push(ChatMessage {
-                            role: ChatRole::System,
-                            content: "Commands: /model /undo /clear /help | Tab to toggle mode".to_string(),
-                            tools: vec![],
-                        });
-                    }
-                    _ => {
-                        app.messages.push(ChatMessage {
-                            role: ChatRole::System,
-                            content: format!("Unknown command: {}. Try /help", input),
-                            tools: vec![],
-                        });
-                    }
-                }
+                handle_slash_command(app, &input).await?;
             } else {
                 send_message(terminal, app, &input).await?;
             }
@@ -386,257 +298,192 @@ async fn handle_key_event(
         }
         KeyCode::Left if app.input_cursor > 0 => app.input_cursor -= 1,
         KeyCode::Right if app.input_cursor < app.input.len() => app.input_cursor += 1,
-        KeyCode::Home => app.input_cursor = 0,
-        KeyCode::End => app.input_cursor = app.input.len(),
         KeyCode::Tab => {
             app.agent.config.plan_mode = !app.agent.config.plan_mode;
-            let mode = if app.agent.config.plan_mode { "ask (read-only)" } else { "agent (full access)" };
-            app.messages.push(ChatMessage {
-                role: ChatRole::System,
-                content: format!("Switched to {} mode", mode),
-                tools: vec![],
-            });
         }
-        KeyCode::Esc => { app.input.clear(); app.input_cursor = 0; }
-        KeyCode::Up if app.scroll > 0 => app.scroll -= 1,
-        KeyCode::Down => app.scroll += 1,
+        KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
+        KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
+        KeyCode::Down => app.scroll = app.scroll.saturating_add(1),
         _ => {}
     }
 
     Ok(())
 }
 
-async fn send_message(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App, 
-    prompt: &str
-) -> Result<()> {
-    // Start background doc prefetch for this query (Context7)
-    app.agent.prefetch_docs(prompt);
-    
-    // Add user message
-    app.messages.push(ChatMessage {
-        role: ChatRole::User,
-        content: prompt.to_string(),
-        tools: vec![],
-    });
-
-    app.agent.messages.push(Message {
-        role: Role::User,
-        content: prompt.to_string(),
-        tool_calls: None,
-        tool_results: None,
-    });
-
-    // Checkpoint
-    if let Some(ref mut ckpt) = app.checkpoint {
-        ckpt.create(&format!("before: {}", &prompt[..prompt.len().min(30)])).ok();
-    }
-
-    // Start thinking
-    app.is_thinking = true;
-    terminal.draw(|f| draw_ui(f, app))?;
-
-    // Get response (blocking but we redraw first)
-    let response = get_completion(&app.agent).await;
-    app.is_thinking = false;
-    
-    handle_agent_response(app, response).await?;
-
-    // Process any pending tools
-    process_remaining_tools(terminal, app).await?;
-
-    // Auto-save session after each interaction
-    app.agent.save_session().ok();
-
-    Ok(())
-}
-
-async fn handle_agent_response(app: &mut App, response: Result<AgentResponse>) -> Result<()> {
-    match response {
-        Ok(AgentResponse::Text(text)) => {
-            app.messages.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: text.clone(),
-                tools: vec![],
-            });
-            app.agent.messages.push(Message {
-                role: Role::Assistant,
-                content: text,
-                tool_calls: None,
-                tool_results: None,
-            });
-        }
-        Ok(AgentResponse::ToolCalls { text, calls }) => {
-            app.messages.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: text.clone(),
-                tools: calls.iter().map(|c| ToolStatus {
-                    name: c.name.clone(),
-                    status: ToolState::Pending,
-                    duration_ms: None,
-                }).collect(),
-            });
-            
-            // Store for processing
-            app.pending_tools = calls;
-            app.tool_results.clear();
-            app.current_tool_idx = 0;
-            
-            // Store text in agent history (will add tool_calls after execution)
-            app.agent.messages.push(Message {
-                role: Role::Assistant,
-                content: text,
-                tool_calls: None, // Will update later
-                tool_results: None,
-            });
-        }
-        Ok(AgentResponse::Completion(result)) => {
-            app.messages.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: format!("✅ {}", result),
-                tools: vec![],
-            });
-            
-            if let Some(ref mut ckpt) = app.checkpoint {
-                ckpt.create("task-completed").ok();
+async fn handle_slash_command(app: &mut App, cmd: &str) -> Result<()> {
+    match cmd {
+        "/model" | "/m" => { app.model_picker_open = true; app.model_picker_selected = 0; }
+        "/undo" => {
+            if let Some(ref ckpt) = app.checkpoint {
+                if ckpt.undo().is_ok() {
+                    app.messages.push(ChatMessage { role: ChatRole::System, content: "Restored to previous checkpoint".to_string(), tools: vec![] });
+                }
             }
         }
-        Ok(AgentResponse::Question(q)) => {
-            app.messages.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: format!("❓ {}", q),
-                tools: vec![],
-            });
+        "/clear" => { app.messages.clear(); app.scroll = 0; }
+        "/help" | "/?" => {
+            app.messages.push(ChatMessage { role: ChatRole::System, content: "Commands: /model /undo /clear /help | Tab: mode | Up/Down: scroll".to_string(), tools: vec![] });
         }
-        Err(e) => {
-            app.messages.push(ChatMessage {
-                role: ChatRole::System,
-                content: format!("Error: {}", e),
-                tools: vec![],
-            });
-        }
+        _ => { app.messages.push(ChatMessage { role: ChatRole::System, content: format!("Unknown command: {}", cmd), tools: vec![] }); }
     }
-    
     Ok(())
 }
 
-async fn process_remaining_tools(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+async fn send_message(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, prompt: &str) -> Result<()> {
+    use tokio::time::{timeout, Duration};
+    use crate::api::streaming::StreamEvent;
+    
+    app.agent.prefetch_docs(prompt);
+    app.messages.push(ChatMessage { role: ChatRole::User, content: prompt.to_string(), tools: vec![] });
+    app.agent.messages.push(Message { role: Role::User, content: prompt.to_string(), tool_calls: None, tool_results: None });
+
+    if let Some(ref mut ckpt) = app.checkpoint { ckpt.create(&format!("before: {}", &prompt[..prompt.len().min(30)])).ok(); }
+
+    app.is_thinking = true;
+    app.messages.push(ChatMessage { role: ChatRole::Assistant, content: String::new(), tools: vec![] });
+    
+    if let Ok(mut rx) = get_completion_streaming(&app.agent).await {
+        let mut accumulated_text = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        
+        loop {
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(event)) => {
+                    match event {
+                        StreamEvent::Text(text) | StreamEvent::Thinking(text) => {
+                            accumulated_text.push_str(&text);
+                            if let Some(msg) = app.messages.last_mut() { msg.content = accumulated_text.clone(); }
+                            terminal.draw(|f| draw_ui(f, app))?;
+                        }
+                        StreamEvent::ToolCall { name, arguments, thought_signature } => {
+                            tool_calls.push(ToolCall { name, arguments, thought_signature });
+                        }
+                        StreamEvent::Done => break,
+                        StreamEvent::Error(e) => {
+                            if let Some(msg) = app.messages.last_mut() { msg.content = format!("⚡ Error: {}", e); }
+                            terminal.draw(|f| draw_ui(f, app))?;
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    app.thinking_count = app.thinking_count.wrapping_add(1);
+                    terminal.draw(|f| draw_ui(f, app))?;
+                }
+            }
+        }
+        
+        app.is_thinking = false;
+        app.agent.messages.push(Message { role: Role::Assistant, content: accumulated_text, tool_calls: None, tool_results: None });
+        
+        if !tool_calls.is_empty() {
+            if let Some(msg) = app.messages.last_mut() {
+                msg.tools = tool_calls.iter().map(|c| ToolStatus { name: c.name.clone(), status: ToolState::Pending, duration_ms: None }).collect();
+            }
+            app.pending_tools = tool_calls;
+            app.tool_results.clear();
+            app.current_tool_idx = 0;
+            process_remaining_tools(terminal, app).await?;
+        }
+    }
+    app.agent.save_session().ok();
+    Ok(())
+}
+
+async fn process_remaining_tools(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     while app.current_tool_idx < app.pending_tools.len() {
         let call = app.pending_tools[app.current_tool_idx].clone();
         let idx = app.current_tool_idx;
-        
-        // Check session yolo OR config auto-approve
-        let approved = app.session_yolo || app.agent.config.should_auto_approve(&call.name);
-        
-        if !approved {
-            // Show diff preview in IDE for file-modifying tools
+        if !(app.session_yolo || app.agent.config.should_auto_approve(&call.name)) {
             preview_tool_diff(&call, app.agent.workdir());
-            
             app.pending_approval = Some(PendingApproval { tool: call, idx });
-            return Ok(()); // Wait for user input
+            return Ok(());
         }
-        
         execute_pending_tool(terminal, app, call, idx).await?;
     }
     
-    // All tools done, get next response if we had tools
     if !app.pending_tools.is_empty() {
         let calls = std::mem::take(&mut app.pending_tools);
         let results = std::mem::take(&mut app.tool_results);
+        if let Some(msg) = app.agent.messages.last_mut() { if msg.role == Role::Assistant { msg.tool_calls = Some(calls); } }
+        app.agent.messages.push(Message { role: Role::Tool, content: String::new(), tool_calls: None, tool_results: Some(results) });
         
-        // Update the last assistant message to include tool_calls
-        if let Some(msg) = app.agent.messages.last_mut() {
-            if msg.role == Role::Assistant {
-                msg.tool_calls = Some(calls);
+        if let Ok(mut rx) = get_completion_streaming(&app.agent).await {
+            app.is_thinking = true;
+            app.messages.push(ChatMessage { role: ChatRole::Assistant, content: String::new(), tools: vec![] });
+            let mut accumulated_text = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                    Ok(Some(event)) => {
+                        use crate::api::streaming::StreamEvent;
+                        match event {
+                            StreamEvent::Text(text) | StreamEvent::Thinking(text) => {
+                                accumulated_text.push_str(&text);
+                                if let Some(msg) = app.messages.last_mut() { msg.content = accumulated_text.clone(); }
+                                terminal.draw(|f| draw_ui(f, app))?;
+                            }
+                            StreamEvent::ToolCall { name, arguments, thought_signature } => { tool_calls.push(ToolCall { name, arguments, thought_signature }); }
+                            StreamEvent::Done => break,
+                            StreamEvent::Error(e) => {
+                                if let Some(msg) = app.messages.last_mut() { msg.content = format!("⚡ Error: {}", e); }
+                                terminal.draw(|f| draw_ui(f, app))?;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => { app.thinking_count = app.thinking_count.wrapping_add(1); terminal.draw(|f| draw_ui(f, app))?; }
+                }
+            }
+            app.is_thinking = false;
+            app.agent.messages.push(Message { role: Role::Assistant, content: accumulated_text, tool_calls: None, tool_results: None });
+            if !tool_calls.is_empty() {
+                if let Some(msg) = app.messages.last_mut() {
+                    msg.tools = tool_calls.iter().map(|c| ToolStatus { name: c.name.clone(), status: ToolState::Pending, duration_ms: None }).collect();
+                }
+                app.pending_tools = tool_calls;
+                app.tool_results.clear();
+                app.current_tool_idx = 0;
+                Box::pin(process_remaining_tools(terminal, app)).await?;
             }
         }
-        
-        // Add tool results message
-        app.agent.messages.push(Message {
-            role: Role::Tool,
-            content: String::new(),
-            tool_calls: None,
-            tool_results: Some(results),
-        });
-        
-        // Get next response
-        app.is_thinking = true;
-        terminal.draw(|f| draw_ui(f, app))?;
-        
-        let response = get_completion(&app.agent).await;
-        app.is_thinking = false;
-        
-        handle_agent_response(app, response).await?;
-        
-        // Recurse for any new tools (boxed to avoid infinite future size)
-        Box::pin(process_remaining_tools(terminal, app)).await?;
     }
-    
     Ok(())
 }
 
-async fn execute_pending_tool(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-    tool: ToolCall,
-    idx: usize,
-) -> Result<()> {
-    // Update status to running
-    if let Some(msg) = app.messages.last_mut() {
-        if idx < msg.tools.len() {
-            msg.tools[idx].status = ToolState::Running;
-        }
-    }
+async fn execute_pending_tool(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, tool: ToolCall, idx: usize) -> Result<()> {
+    if let Some(msg) = app.messages.last_mut() { if idx < msg.tools.len() { msg.tools[idx].status = ToolState::Running; } }
     terminal.draw(|f| draw_ui(f, app))?;
-    
-    // Execute
     let start = std::time::Instant::now();
     let result = tools::execute(&tool, app.agent.workdir(), app.agent.config.plan_mode).await;
     let duration = start.elapsed().as_millis() as u64;
-    
-    // Update status
     if let Some(msg) = app.messages.last_mut() {
         if idx < msg.tools.len() {
             msg.tools[idx].status = if result.success { ToolState::Success } else { ToolState::Failed };
             msg.tools[idx].duration_ms = Some(duration);
         }
     }
-    
-    // Store actual result for sending to LLM
     app.tool_results.push((tool.name, result));
     app.current_tool_idx += 1;
-    
     Ok(())
 }
 
-/// Show diff preview in IDE for file-modifying tools (before approval)
 fn preview_tool_diff(tool: &ToolCall, workdir: &std::path::Path) {
     use crate::tools::ide;
-    
-    let name = tool.name.as_str();
     let args = &tool.arguments;
-    
-    match name {
+    match tool.name.as_str() {
         "write_to_file" => {
-            if let (Some(path), Some(content)) = (
-                args.get("path").and_then(|v| v.as_str()),
-                args.get("content").and_then(|v| v.as_str())
-            ) {
+            if let (Some(path), Some(content)) = (args.get("path").and_then(|v| v.as_str()), args.get("content").and_then(|v| v.as_str())) {
                 let full_path = workdir.join(path);
                 let old_content = std::fs::read_to_string(&full_path).unwrap_or_default();
                 ide::show_diff_in_ide(&full_path, &old_content, content);
             }
         }
         "replace_in_file" => {
-            if let (Some(path), Some(old_str), Some(new_str)) = (
-                args.get("path").and_then(|v| v.as_str()),
-                args.get("old_str").and_then(|v| v.as_str()),
-                args.get("new_str").and_then(|v| v.as_str())
-            ) {
+            if let (Some(path), Some(old_str), Some(new_str)) = (args.get("path").and_then(|v| v.as_str()), args.get("old_str").and_then(|v| v.as_str()), args.get("new_str").and_then(|v| v.as_str())) {
                 let full_path = workdir.join(path);
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     let new_content = content.replacen(old_str, new_str, 1);
@@ -644,336 +491,153 @@ fn preview_tool_diff(tool: &ToolCall, workdir: &std::path::Path) {
                 }
             }
         }
-        "apply_patch" => {
-            // For patches, just show the file that will be modified
-            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                let full_path = workdir.join(path);
-                ide::open_file_in_ide(&full_path, None);
-            }
-        }
         _ => {}
     }
 }
 
-async fn get_completion(agent: &Agent) -> Result<AgentResponse> {
-    use crate::api::{gemini, anthropic, openai};
-    
-    // Get any prefetched documentation from Context7
+async fn get_completion_streaming(agent: &Agent) -> Result<crate::api::streaming::StreamReceiver> {
+    use crate::api::gemini;
     let prefetched_docs = agent.doc_prefetcher().get_cached_docs_for_prompt();
-    
-    let system_prompt = format!(
-        "You are Forge, a terminal-first AI coding agent.\n\
-         Mode: {} ({})\n\
-         Working directory: {}\n\n\
-         Rules:\n\
-         - Be concise and direct\n\
-         - Use tools to complete tasks\n\
-         - Always use attempt_completion when done\n\
-         - Read files before editing them\n\
-         {}",
-        if agent.config.plan_mode { "PLAN" } else { "ACT" },
-        if agent.config.plan_mode { "read-only, no modifications" } else { "full access" },
-        agent.workdir().display(),
-        prefetched_docs
-    );
+    let system_prompt = format!("You are Forge, a terminal-first AI coding agent.\nWorking directory: {}\n\nRules:\n- Be concise and direct\n- Use tools to complete tasks\n- Read files before editing\n{}", agent.workdir().display(), prefetched_docs);
     let tool_defs = tools::definitions(agent.config.plan_mode);
 
     match agent.config.provider.as_str() {
-        "gemini" => gemini::complete(&agent.config, &system_prompt, agent.messages(), &tool_defs).await,
-        "anthropic" => anthropic::complete(&agent.config, &system_prompt, agent.messages(), &tool_defs).await,
-        // OpenAI and OpenAI-compatible providers (Groq, Together, OpenRouter)
-        "openai" | "groq" | "together" | "openrouter" => {
-            openai::complete(&agent.config, &system_prompt, agent.messages(), &tool_defs).await
+        "gemini" => gemini::complete_streaming(&agent.config, &system_prompt, agent.messages(), &tool_defs).await,
+        _ => {
+            use crate::api::{anthropic, openai, streaming::{StreamEvent, create_stream}};
+            let (tx, rx) = create_stream();
+            let config = agent.config.clone();
+            let messages = agent.messages().to_vec();
+            let provider = agent.config.provider.clone();
+            tokio::spawn(async move {
+                let result = match provider.as_str() {
+                    "anthropic" => anthropic::complete(&config, &system_prompt, &messages, &tool_defs).await,
+                    "openai" | "groq" | "together" | "openrouter" => openai::complete(&config, &system_prompt, &messages, &tool_defs).await,
+                    _ => Err(anyhow::anyhow!("Unknown provider")),
+                };
+                match result {
+                    Ok(crate::api::AgentResponse::Text(text)) => { tx.send(StreamEvent::Text(text)).await.ok(); }
+                    Ok(crate::api::AgentResponse::ToolCalls { text, calls }) => {
+                        if !text.is_empty() { tx.send(StreamEvent::Text(text)).await.ok(); }
+                        for call in calls { tx.send(StreamEvent::ToolCall { name: call.name, arguments: call.arguments, thought_signature: call.thought_signature }).await.ok(); }
+                    }
+                    Err(e) => { tx.send(StreamEvent::Error(e.to_string())).await.ok(); }
+                    _ => {}
+                }
+                tx.send(StreamEvent::Done).await.ok();
+            });
+            Ok(rx)
         }
-        _ => Err(anyhow::anyhow!("Unknown provider: {}", agent.config.provider)),
     }
 }
 
-
-// ============ DRAWING ============
-
-fn draw_ui(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
+fn draw_ui(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(5), Constraint::Length(3), Constraint::Length(1)]).split(f.area());
     draw_messages(f, app, chunks[0]);
     draw_input(f, app, chunks[1]);
     draw_status_bar(f, app, chunks[2]);
-
-    if app.command_palette_open {
-        draw_command_palette(f, app, f.area());
-    }
-
-    if app.model_picker_open {
-        draw_model_picker(f, app, f.area());
-    }
-
-    if let Some(ref pending) = app.pending_approval {
-        draw_approval_dialog(f, pending, f.area());
-    }
+    if app.command_palette_open { draw_command_palette(f, app, f.area()); }
+    if app.model_picker_open { draw_model_picker(f, app, f.area()); }
+    if let Some(ref pending) = app.pending_approval { draw_approval_dialog(f, pending, f.area()); }
 }
 
 fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
-    if app.messages.is_empty() && !app.is_thinking {
-        // Big FORGE ASCII art with braille fire on the right (aligned at bottom)
-        let art_lines = [
-            ("                                            ", "  ⠀⠀⠀⢱⣆⠀⠀⠀"),
-            ("                                            ", "  ⠀⠀⠀⠈⣿⣷⡀⠀⠀"),
-            ("                                            ", "  ⠀⠀⠀⢸⣿⣿⣷⣧⠀"),
-            ("                                            ", "  ⠀⡀⢠⣿⡟⣿⣿⣿⡇"),
-            ("                                            ", "  ⠀⣳⣼⣿⡏⢸⣿⣿⣿"),
-            ("                                            ", "  ⣰⣿⣿⡿⠁⢸⣿⣿⡟"),
-            (" ███████╗ ██████╗ ██████╗  ██████╗ ███████╗", " ⣾⣿⣿⠟⠀⠀⣾⢿⣿⣿"),
-            (" ██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝", " ⣿⣿⡏⠀⠀⠀⠃⠸⣿⣿"),
-            (" █████╗  ██║   ██║██████╔╝██║  ███╗█████╗  ", " ⳿⣿⣿⠀⠀⠀⠀⢹⣿⡿"),
-            (" ██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝  ", " ⠀⠹⣿⣿⡄⠀⠀⢠⣿⡞"),
-            (" ██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗", " ⠀⠀⠈⠛⢿⣄⠀⣠⠞⠁"),
-            (" ╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝", ""),
-        ];
-
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from("")); // Top padding
-        
-        for (forge_part, fire_part) in art_lines {
-            lines.push(Line::from(vec![
-                Span::styled(forge_part, Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
-                Span::styled(fire_part, Style::default().fg(ORANGE)),
-            ]));
-        }
-        
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            " Terminal-first AI coding agent with high-performance context assembly",
-            Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
-        )));
-        lines.push(Line::from(""));
-        
-        // Model info
-        let model_info = format!(" {} / {}", app.agent.config.provider, app.agent.config.model);
-        lines.push(Line::from(Span::styled(model_info, Style::default().fg(DIM))));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(" What would you like to build?", Style::default().fg(WHITE))));
-
-        let para = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left);
-        f.render_widget(para, area);
-        return;
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-
+    if app.messages.is_empty() && !app.is_thinking { draw_welcome(f, app, area); return; }
+    let mut lines = Vec::new();
     for msg in &app.messages {
         lines.push(Line::from(""));
-
         match msg.role {
             ChatRole::User => {
                 lines.push(Line::from(Span::styled("You", Style::default().fg(BLUE).add_modifier(Modifier::BOLD))));
-                for line in msg.content.lines() {
-                    lines.push(Line::from(Span::styled(line, Style::default().fg(Color::White))));
-                }
+                for l in msg.content.lines() { lines.push(Line::from(l)); }
             }
             ChatRole::Assistant => {
                 lines.push(Line::from(Span::styled("Forge", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD))));
-                
-                if !msg.content.is_empty() {
-                    for line in msg.content.lines() {
-                        lines.push(Line::from(Span::styled(line, Style::default().fg(Color::White))));
-                    }
-                }
-
+                for l in msg.content.lines() { lines.push(Line::from(l)); }
                 for tool in &msg.tools {
-                    let (icon, color) = match tool.status {
-                        ToolState::Pending => ("○", DIM),
-                        ToolState::Running => ("●", ORANGE),
-                        ToolState::Success => ("✓", GREEN),
-                        ToolState::Failed => ("✗", RED),
-                        ToolState::Skipped => ("−", DIM),
-                    };
-
-                    let duration = tool.duration_ms.map(|ms| format!(" {}ms", ms)).unwrap_or_default();
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                        Span::styled(&tool.name, Style::default().fg(WHITE)),
-                        Span::styled(duration, Style::default().fg(DIM)),
-                    ]));
+                    let color = match tool.status { ToolState::Running => ORANGE, ToolState::Success => GREEN, ToolState::Failed => RED, _ => DIM };
+                    lines.push(Line::from(vec![Span::styled("  ● ", Style::default().fg(color)), Span::styled(&tool.name, Style::default().fg(WHITE))]));
                 }
             }
-            ChatRole::System => {
-                lines.push(Line::from(vec![
-                    Span::styled("⚡ ", Style::default().fg(YELLOW)),
-                    Span::styled(&msg.content, Style::default().fg(YELLOW)),
-                ]));
-            }
+            ChatRole::System => { lines.push(Line::from(Span::styled(&msg.content, Style::default().fg(YELLOW).add_modifier(Modifier::ITALIC)))); }
         }
     }
-
     if app.is_thinking {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Forge ", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled("thinking...", Style::default().fg(DIM)),
-        ]));
+        let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = spinner_chars[app.thinking_count % spinner_chars.len()];
+        lines.push(Line::from(vec![Span::styled(format!("Forge {} ", spinner), Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)), Span::styled("thinking...", Style::default().fg(DIM))]));
     }
+    
+    // Auto-scroll logic
+    let content_height = lines.len();
+    let visible_height = area.height as usize;
+    let max_scroll = content_height.saturating_sub(visible_height);
+    let scroll = if app.is_thinking { max_scroll } else { app.scroll.min(max_scroll) };
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll as u16, 0));
-
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll as u16, 0));
     f.render_widget(para, area);
+}
+
+fn draw_welcome(f: &mut Frame, _app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" ███████╗ ██████╗ ██████╗  ██████╗ ███████╗", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(" ██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(" █████╗  ██║   ██║██████╔╝██║  ███╗█████╗  ", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(" ██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝  ", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(" ██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Terminal-first AI coding agent", Style::default().fg(DIM))));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" What would you like to build?", Style::default().fg(WHITE))));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let placeholder = if app.input.is_empty() { " Type a message..." } else { "" };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.mode_color()))
-        .title(Span::styled(placeholder, Style::default().fg(DIM)));
-
-    let input = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(WHITE))
-        .block(block);
-
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(app.mode_color())).title(Span::styled(placeholder, Style::default().fg(DIM)));
+    let input = Paragraph::new(app.input.as_str()).style(Style::default().fg(WHITE)).block(block);
     f.render_widget(input, area);
-    
     if !app.is_thinking && app.pending_approval.is_none() {
         f.set_cursor_position((area.x + app.input_cursor as u16 + 1, area.y + 1));
     }
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    // Shorten model name for display
-    let model_display = if app.agent.config.model.len() > 20 {
-        format!("{}...", &app.agent.config.model[..17])
-    } else {
-        app.agent.config.model.clone()
-    };
-    
-    let status = Line::from(vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(&model_display, Style::default().fg(ORANGE)),
-        Span::styled("  •  ", Style::default().fg(DIM)),
-        Span::styled(format!("{} mode", app.mode_text()), Style::default().fg(app.mode_color()).add_modifier(Modifier::BOLD)),
-        Span::styled(" (Tab)", Style::default().fg(DIM)),
-        Span::styled("  │  ", Style::default().fg(DIM)),
-        Span::styled("/model", Style::default().fg(WHITE)),
-        Span::styled("  ", Style::default().fg(DIM)),
-        Span::styled("/undo", Style::default().fg(WHITE)),
-        Span::styled("  ", Style::default().fg(DIM)),
-        Span::styled("/help", Style::default().fg(WHITE)),
-    ]);
-
+    let status = Line::from(vec![Span::styled(format!(" {} ", app.agent.config.model), Style::default().fg(ORANGE)), Span::styled("  •  ", Style::default().fg(DIM)), Span::styled(format!("{} mode", app.mode_text()), Style::default().fg(app.mode_color()).add_modifier(Modifier::BOLD)), Span::styled("  │  Ctrl+K: commands  │  Tab: toggle mode", Style::default().fg(DIM))]);
     f.render_widget(Paragraph::new(status), area);
 }
 
 fn draw_model_picker(f: &mut Frame, app: &App, area: Rect) {
     let models = app.agent.config.get_models(&app.agent.config.provider);
-    
-    let width = 45.min(area.width - 4);
-    let height = (models.len() as u16 + 3).min(area.height - 4);
-    let x = (area.width - width) / 2;
-    let y = (area.height - height) / 3;
-
-    let rect = Rect::new(x, y, width, height);
+    let rect = centered_rect(45.min(area.width - 4), (models.len() as u16 + 2).min(area.height - 4), area);
     f.render_widget(Clear, rect);
-
-    let title = format!(" {} Models ", app.agent.config.provider.to_uppercase());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ORANGE))
-        .title(Span::styled(title, Style::default().fg(ORANGE)));
-
-    let items: Vec<ListItem> = models
-        .iter()
-        .enumerate()
-        .map(|(i, model)| {
-            let is_current = model == &app.agent.config.model;
-            let prefix = if is_current { "● " } else { "  " };
-            
-            let style = if i == app.model_picker_selected {
-                Style::default().fg(Color::Black).bg(ORANGE)
-            } else if is_current {
-                Style::default().fg(GREEN)
-            } else {
-                Style::default().fg(WHITE)
-            };
-            
-            // Shorten long model names
-            let display_name = if model.len() > 35 {
-                format!("{}...", &model[..32])
-            } else {
-                model.clone()
-            };
-            
-            ListItem::new(Line::from(Span::styled(format!("{}{}", prefix, display_name), style)))
-        })
-        .collect();
-
-    f.render_widget(List::new(items).block(block), rect);
+    let items: Vec<ListItem> = models.iter().enumerate().map(|(i, m)| {
+        let style = if i == app.model_picker_selected { Style::default().bg(ORANGE).fg(Color::Black) } else { Style::default().fg(WHITE) };
+        ListItem::new(Line::from(Span::styled(format!("  {} ", m), style)))
+    }).collect();
+    f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(" Models ")), rect);
 }
 
 fn draw_command_palette(f: &mut Frame, app: &App, area: Rect) {
-    let width = 30.min(area.width - 4);
-    let height = (COMMANDS.len() as u16 + 2).min(area.height - 4);
-    let x = (area.width - width) / 2;
-    let y = (area.height - height) / 3;
-
-    let rect = Rect::new(x, y, width, height);
+    let rect = centered_rect(30.min(area.width - 4), (COMMANDS.len() as u16 + 2).min(area.height - 4), area);
     f.render_widget(Clear, rect);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ORANGE))
-        .title(Span::styled(" Commands ", Style::default().fg(ORANGE)));
-
-    let items: Vec<ListItem> = COMMANDS
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let style = if i == app.command_palette_selected {
-                Style::default().bg(ORANGE).fg(Color::Black)
-            } else {
-                Style::default().fg(WHITE)
-            };
-            ListItem::new(Line::from(Span::styled(format!("  {} ", name), style)))
-        })
-        .collect();
-
-    f.render_widget(List::new(items).block(block), rect);
+    let items: Vec<ListItem> = COMMANDS.iter().enumerate().map(|(i, c)| {
+        let style = if i == app.command_palette_selected { Style::default().bg(ORANGE).fg(Color::Black) } else { Style::default().fg(WHITE) };
+        ListItem::new(Line::from(Span::styled(format!("  {} ", c), style)))
+    }).collect();
+    f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(" Commands ")), rect);
 }
 
 fn draw_approval_dialog(f: &mut Frame, pending: &PendingApproval, area: Rect) {
-    let width = 60.min(area.width - 4);
-    let height = 6;
-    let x = (area.width - width) / 2;
-    let y = (area.height - height) / 2;
-
-    let rect = Rect::new(x, y, width, height);
+    let rect = centered_rect(60, 7, area);
     f.render_widget(Clear, rect);
+    let tool_info = format!("  Approve: {}?", pending.tool.name);
+    let content = vec![Line::from(""), Line::from(Span::styled(tool_info, Style::default().fg(WHITE))), Line::from(""), Line::from(vec![Span::styled("  [", Style::default().fg(DIM)), Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)), Span::styled("]es  [", Style::default().fg(DIM)), Span::styled("n", Style::default().fg(RED).add_modifier(Modifier::BOLD)), Span::styled("]o  [", Style::default().fg(DIM)), Span::styled("a", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)), Span::styled("]ll yes", Style::default().fg(DIM))])];
+    f.render_widget(Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(format!(" {} ", pending.tool.name))), rect);
+}
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(YELLOW))
-        .title(Span::styled(format!(" {} ", pending.tool.name), Style::default().fg(YELLOW)));
-
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled("  Diff preview opened in IDE", Style::default().fg(DIM))),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  [", Style::default().fg(DIM)),
-            Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("] yes  [", Style::default().fg(DIM)),
-            Span::styled("n", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-            Span::styled("] no  [", Style::default().fg(DIM)),
-            Span::styled("a", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled("] yes to all (session)", Style::default().fg(DIM)),
-        ]),
-    ];
-
-    f.render_widget(Paragraph::new(content).block(block), rect);
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    Rect::new((area.width - width) / 2, (area.height - height) / 2, width, height)
 }

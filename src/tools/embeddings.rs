@@ -323,7 +323,7 @@ impl EmbeddingStore {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Embedding batch failed: {}", e);
+                    tracing::warn!("Embedding batch failed: {}", e);
                 }
             }
         }

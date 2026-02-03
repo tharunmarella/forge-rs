@@ -23,15 +23,26 @@ pub async fn complete_streaming(
         "{}/{}:streamGenerateContent?key={}&alt=sse",
         API_URL, config.model, api_key
     );
+    
+    tracing::debug!("Gemini streaming URL: {}", url.replace(&api_key, "***"));
+    tracing::debug!("Model: {}", config.model);
 
     let request_body = build_request(system_prompt, messages, tools, &config.model);
     
     // Spawn streaming task
     let client = reqwest::Client::new();
+    let model_name = config.model.clone();
     tokio::spawn(async move {
+        tracing::debug!("Starting Gemini stream for model: {}", model_name);
         match stream_response(&client, &url, request_body, tx.clone()).await {
-            Ok(_) => { tx.send(StreamEvent::Done).await.ok(); }
-            Err(e) => { tx.send(StreamEvent::Error(e.to_string())).await.ok(); }
+            Ok(_) => { 
+                tracing::debug!("Gemini stream completed successfully");
+                tx.send(StreamEvent::Done).await.ok(); 
+            }
+            Err(e) => { 
+                tracing::error!("Gemini stream error: {}", e);
+                tx.send(StreamEvent::Error(e.to_string())).await.ok(); 
+            }
         }
     });
 
@@ -71,19 +82,46 @@ async fn stream_response(
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
 
+    tracing::info!("Starting to read stream...");
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete SSE events
-        while let Some(pos) = buffer.find("\n\n") {
-            let event = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
-
-            if let Some(data) = event.strip_prefix("data: ") {
-                if let Ok(json) = serde_json::from_str::<Value>(data) {
-                    process_chunk(&json, &tx).await?;
+        // Process complete lines only (lines ending with \n)
+        while let Some(newline_pos) = buffer.find('\n') {
+            let line = buffer[..newline_pos].to_string();
+            buffer = buffer[newline_pos + 1..].to_string();
+            
+            // Skip empty lines
+            if line.trim().is_empty() {
+                continue;
+            }
+            
+            if let Some(data) = line.strip_prefix("data: ") {
+                tracing::info!("Processing SSE line: {} chars", data.len());
+                match serde_json::from_str::<Value>(data) {
+                    Ok(json) => {
+                        if let Some(error) = json.get("error") {
+                            let msg = error["message"].as_str().unwrap_or("Unknown streaming error");
+                            tx.send(StreamEvent::Error(msg.to_string())).await.ok();
+                            return Err(anyhow::anyhow!("Gemini streaming error: {}", msg));
+                        }
+                        process_chunk(&json, &tx).await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse SSE: {} - {}", e, &data[..data.len().min(80)]);
+                    }
                 }
+            }
+        }
+    }
+    
+    // Process any remaining data in buffer
+    if !buffer.trim().is_empty() {
+        if let Some(data) = buffer.strip_prefix("data: ") {
+            if let Ok(json) = serde_json::from_str::<Value>(data.trim()) {
+                process_chunk(&json, &tx).await?;
             }
         }
     }
@@ -92,23 +130,30 @@ async fn stream_response(
 }
 
 async fn process_chunk(json: &Value, tx: &mpsc::Sender<StreamEvent>) -> Result<()> {
+    let num_candidates = json["candidates"].as_array().map(|a| a.len()).unwrap_or(0);
+    tracing::info!("Processing chunk: {} candidates", num_candidates);
+    
     if let Some(candidates) = json["candidates"].as_array() {
         for candidate in candidates {
             if let Some(parts) = candidate["content"]["parts"].as_array() {
+                tracing::info!("Found {} parts in candidate", parts.len());
                 for part in parts {
                     // Handle text
                     if let Some(text) = part["text"].as_str() {
-                        tx.send(StreamEvent::Text(text.to_string())).await.ok();
+                        tracing::info!("Part has text: {} chars, empty: {}", text.len(), text.is_empty());
+                        if !text.is_empty() {
+                            tx.send(StreamEvent::Text(text.to_string())).await.ok();
+                        }
                     }
                     
                     // Handle function calls
                     if let Some(fc) = part.get("functionCall") {
                         let name = fc["name"].as_str().unwrap_or("").to_string();
                         let args = fc.get("args").cloned().unwrap_or(Value::Object(Default::default()));
-                        // Extract thought signature for Gemini 3
                         let thought_signature = part.get("thoughtSignature")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string());
+                        tracing::info!("Sending tool call: {}", name);
                         tx.send(StreamEvent::ToolCall { name, arguments: args, thought_signature }).await.ok();
                     }
                 }
@@ -217,11 +262,11 @@ fn build_request(system_prompt: &str, messages: &[Message], tools: &[Value], mod
         }
     });
     
-    // For Gemini 3 models, disable thinking to avoid thought_signature requirement
-    // (thought signatures require complex state tracking across turns)
-    if model.contains("gemini-3") {
+    // For Gemini 3 Pro models, enable thinking mode with a budget
+    // Flash models may not require this
+    if model.contains("gemini-3") && model.contains("pro") {
         request["generationConfig"]["thinkingConfig"] = serde_json::json!({
-            "thinkingBudget": 0
+            "thinkingBudget": 8192
         });
     }
     

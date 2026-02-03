@@ -101,8 +101,8 @@ fn default_gemini_models() -> Vec<String> {
         "gemini-2.5-flash".into(),
         "gemini-2.5-pro".into(),
         "gemini-2.0-flash".into(),
-        "gemini-3-pro-preview".into(),
         "gemini-3-flash-preview".into(),
+        "gemini-3-pro-preview".into(),
     ]
 }
 
