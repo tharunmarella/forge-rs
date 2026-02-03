@@ -134,12 +134,13 @@ pub async fn run(agent: Agent) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(agent);
+    let session_start = std::time::Instant::now();
 
     if let Some(ref mut ckpt) = app.checkpoint {
         ckpt.create("session-start").ok();
     }
 
-    let result = run_app(&mut terminal, &mut app).await;
+    let result = run_app(&mut terminal, &mut app, session_start).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -148,8 +149,22 @@ pub async fn run(agent: Agent) -> Result<()> {
     result
 }
 
-async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, session_start: std::time::Instant) -> Result<()> {
     loop {
+        // Check session timeout
+        if let Some(timeout_secs) = app.agent.config.timeout {
+            if session_start.elapsed().as_secs() >= timeout_secs {
+                app.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!("Session timeout reached ({}s). Saving and exiting...", timeout_secs),
+                    tools: vec![],
+                });
+                terminal.draw(|f| draw_ui(f, app))?;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                app.should_quit = true;
+            }
+        }
+
         // Draw UI
         terminal.draw(|f| draw_ui(f, app))?;
 

@@ -18,6 +18,10 @@ pub enum EmbeddingProvider {
     Gemini { api_key: String },
     /// OpenAI embeddings (works with OpenAI-compatible APIs)
     OpenAI { api_key: String, base_url: String },
+    /// Ollama local embeddings
+    Ollama { base_url: String },
+    /// Disabled (no embeddings)
+    None,
 }
 
 impl EmbeddingProvider {
@@ -43,6 +47,9 @@ impl EmbeddingProvider {
             "openrouter" => EmbeddingProvider::OpenAI {
                 api_key: api_key.unwrap_or_default().to_string(),
                 base_url: base_url.unwrap_or("https://openrouter.ai/api/v1").to_string(),
+            },
+            "ollama" => EmbeddingProvider::Ollama {
+                base_url: base_url.unwrap_or("http://localhost:11434").to_string(),
             },
             // Default to Voyage (works without user API key)
             _ => EmbeddingProvider::Voyage,
@@ -77,6 +84,11 @@ impl EmbeddingStore {
         })
     }
 
+    /// Generate embeddings for texts (public for use by EmbeddingDb)
+    pub async fn embed_texts_public(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_texts(texts).await
+    }
+    
     /// Generate embeddings for texts
     async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
@@ -88,6 +100,13 @@ impl EmbeddingStore {
             EmbeddingProvider::Gemini { api_key } => self.embed_gemini(texts, api_key).await,
             EmbeddingProvider::OpenAI { api_key, base_url } => {
                 self.embed_openai(texts, api_key, base_url).await
+            }
+            EmbeddingProvider::Ollama { base_url } => {
+                self.embed_ollama(texts, base_url).await
+            }
+            EmbeddingProvider::None => {
+                // Return zero vectors (embeddings disabled)
+                Ok(texts.iter().map(|_| vec![0.0; 384]).collect())
             }
         }
     }
@@ -236,9 +255,58 @@ impl EmbeddingStore {
         Ok(response.data.into_iter().map(|e| e.embedding).collect())
     }
 
+    /// Ollama local embeddings
+    async fn embed_ollama(&self, texts: &[&str], base_url: &str) -> Result<Vec<Vec<f32>>> {
+        #[derive(Serialize)]
+        struct OllamaRequest<'a> {
+            model: &'static str,
+            prompt: &'a str,
+        }
+
+        #[derive(Deserialize)]
+        struct OllamaResponse {
+            embedding: Vec<f32>,
+        }
+
+        let mut embeddings = Vec::new();
+        
+        // Ollama doesn't support batch embeddings, so we process one at a time
+        for text in texts {
+            let resp = self
+                .client
+                .post(format!("{}/api/embeddings", base_url))
+                .header("Content-Type", "application/json")
+                .json(&OllamaRequest {
+                    model: "nomic-embed-text",  // Common embedding model for Ollama
+                    prompt: text,
+                })
+                .send()
+                .await;
+            
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(response) = r.json::<OllamaResponse>().await {
+                        embeddings.push(response.embedding);
+                    } else {
+                        // Fallback: return zero vector if parsing fails
+                        embeddings.push(vec![0.0; 768]);
+                    }
+                }
+                _ => {
+                    // Embedding model not available, use zero vector
+                    embeddings.push(vec![0.0; 768]);
+                }
+            }
+        }
+
+        Ok(embeddings)
+    }
+
     /// Index a workspace directory
     pub async fn index_workspace(&self, workdir: &Path) -> Result<usize> {
         let mut all_chunks = Vec::new();
+        const MAX_FILES: usize = 200; // Limit for API calls
+        let mut file_count = 0;
 
         for entry in WalkDir::new(workdir)
             .max_depth(8)
@@ -246,7 +314,27 @@ impl EmbeddingStore {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            if file_count >= MAX_FILES {
+                break;
+            }
+            
             let path = entry.path();
+            let path_str = path.to_string_lossy();
+            
+            // Skip common non-source directories
+            if path_str.contains("node_modules")
+                || path_str.contains("/target/")
+                || path_str.contains("/.git/")
+                || path_str.contains("/vendor/")
+                || path_str.contains("/reference-repos/")
+                || path_str.contains("/__pycache__/")
+                || path_str.contains("/.venv/")
+                || path_str.contains("/dist/")
+                || path_str.contains("/build/")
+            {
+                continue;
+            }
+            
             let rel_path = path.strip_prefix(workdir).unwrap_or(path);
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
@@ -258,6 +346,7 @@ impl EmbeddingStore {
             if let Ok(content) = std::fs::read_to_string(path) {
                 let chunks = chunk_code(&content, &rel_path.display().to_string());
                 all_chunks.extend(chunks);
+                file_count += 1;
             }
         }
 

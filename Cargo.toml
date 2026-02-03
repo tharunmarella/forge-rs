@@ -44,11 +44,14 @@ git2 = { version = "0.19", default-features = false }
 # OpenSSL (vendored to avoid system dependency issues in CI)
 openssl = { version = "0.10", features = ["vendored"] }
 
+# Database for embeddings persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Utils
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

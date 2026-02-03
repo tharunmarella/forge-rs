@@ -1,7 +1,21 @@
 use super::treesitter;
 use super::ToolResult;
+use crate::lsp::LspManager;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+// Global LSP manager (lazy initialized)
+static LSP_MANAGER: OnceLock<Mutex<Option<LspManager>>> = OnceLock::new();
+
+/// Initialize or get the LSP manager
+async fn get_lsp_manager(workdir: &Path) -> Option<&'static Mutex<Option<LspManager>>> {
+    let manager = LSP_MANAGER.get_or_init(|| {
+        Mutex::new(Some(LspManager::new(workdir.to_path_buf())))
+    });
+    Some(manager)
+}
 
 /// List code definitions (functions, classes, etc.) using tree-sitter
 pub async fn list_definitions(args: &Value, workdir: &Path) -> ToolResult {
@@ -51,14 +65,72 @@ pub async fn list_definitions(args: &Value, workdir: &Path) -> ToolResult {
     }
 }
 
-/// Get symbol definition using tree-sitter
+/// Get symbol definition using LSP (with tree-sitter/regex fallback)
 pub async fn get_definition(args: &Value, workdir: &Path) -> ToolResult {
     let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'symbol' parameter");
     };
 
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let line = args.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let character = args.get("character").and_then(|v| v.as_u64()).map(|v| v as u32);
     let search_path = workdir.join(path);
+    
+    // Try LSP first if we have line/character position
+    if let (Some(line), Some(character)) = (line, character) {
+        if search_path.is_file() {
+            if let Some(manager_lock) = get_lsp_manager(workdir).await {
+                let manager = manager_lock.lock().await;
+                if let Some(ref mgr) = *manager {
+                    if let Some(locations) = mgr.go_to_definition(&search_path, line, character).await {
+                        if !locations.is_empty() {
+                            let mut results = Vec::new();
+                            for loc in locations.iter().take(5) {
+                                if let Some(file_path) = loc.file_path() {
+                                    let rel_path = Path::new(&file_path)
+                                        .strip_prefix(workdir)
+                                        .unwrap_or(Path::new(&file_path));
+                                    
+                                    // Read context around the definition
+                                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                        let lines: Vec<&str> = content.lines().collect();
+                                        let start = loc.range.start.line as usize;
+                                        let end = (loc.range.end.line as usize + 5).min(lines.len());
+                                        
+                                        let context: String = lines[start..end]
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, l)| format!("{:4}|{}", start + i + 1, l))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        
+                                        results.push(format!(
+                                            "{}:{}\n{}",
+                                            rel_path.display(),
+                                            loc.range.start.line + 1,
+                                            context
+                                        ));
+                                    } else {
+                                        results.push(format!(
+                                            "{}:{}:{}",
+                                            rel_path.display(),
+                                            loc.range.start.line + 1,
+                                            loc.range.start.character + 1
+                                        ));
+                                    }
+                                }
+                            }
+                            if !results.is_empty() {
+                                return ToolResult::ok(format!("Found via LSP:\n{}", results.join("\n\n")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback to tree-sitter/regex search by symbol name
 
     // Search files with tree-sitter
     for entry in walkdir::WalkDir::new(&search_path)
@@ -144,15 +216,69 @@ pub async fn get_definition(args: &Value, workdir: &Path) -> ToolResult {
     ToolResult::err(format!("Definition for '{}' not found", symbol))
 }
 
-/// Find symbol references
+/// Find symbol references using LSP (with regex fallback)
 pub async fn find_references(args: &Value, workdir: &Path) -> ToolResult {
     let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'symbol' parameter");
     };
 
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let line = args.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let character = args.get("character").and_then(|v| v.as_u64()).map(|v| v as u32);
     let search_path = workdir.join(path);
-
+    
+    // Try LSP first if we have line/character position
+    if let (Some(line), Some(character)) = (line, character) {
+        if search_path.is_file() {
+            if let Some(manager_lock) = get_lsp_manager(workdir).await {
+                let manager = manager_lock.lock().await;
+                if let Some(ref mgr) = *manager {
+                    if let Some(locations) = mgr.find_references(&search_path, line, character).await {
+                        if !locations.is_empty() {
+                            let mut results: Vec<String> = locations.iter()
+                                .take(50)
+                                .filter_map(|loc| {
+                                    let file_path = loc.file_path()?;
+                                    let rel_path = Path::new(&file_path)
+                                        .strip_prefix(workdir)
+                                        .unwrap_or(Path::new(&file_path));
+                                    
+                                    // Get the line content
+                                    let line_content = std::fs::read_to_string(&file_path).ok()
+                                        .and_then(|content| {
+                                            content.lines()
+                                                .nth(loc.range.start.line as usize)
+                                                .map(|l| l.trim().to_string())
+                                        })
+                                        .unwrap_or_default();
+                                    
+                                    Some(format!(
+                                        "{}:{}:{}",
+                                        rel_path.display(),
+                                        loc.range.start.line + 1,
+                                        line_content
+                                    ))
+                                })
+                                .collect();
+                            
+                            if !results.is_empty() {
+                                if locations.len() > 50 {
+                                    results.push("... (truncated)".to_string());
+                                }
+                                return ToolResult::ok(format!(
+                                    "Found {} references via LSP:\n{}",
+                                    locations.len(),
+                                    results.join("\n")
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback to regex search
     let pattern = format!(r"\b{}\b", regex::escape(symbol));
     let regex = match regex::Regex::new(&pattern) {
         Ok(r) => r,

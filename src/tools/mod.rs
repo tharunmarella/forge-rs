@@ -4,10 +4,13 @@ mod search;
 mod code;
 mod web;
 mod embeddings;
+mod embeddings_store;
 mod treesitter;
 pub mod ide;
+pub mod lint;
 
 pub use embeddings::{EmbeddingProvider, EmbeddingStore};
+pub use lint::{lint_file, LintResult, LintError, LintSeverity};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -23,28 +26,37 @@ pub use web::*;
 /// All available tools
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    // Essential
+    // Essential file operations
     ExecuteCommand,
     ReadFile,
     WriteToFile,
     ReplaceInFile,
     ApplyPatch,
     ListFiles,
-    SearchFiles,
-    AttemptCompletion,
-    AskFollowupQuestion,
+    DeleteFile,
+    
+    // Search
+    Grep,
+    Glob,
+    CodebaseSearch,
     
     // Code intelligence
-    CodebaseSearch,
     ListCodeDefinitions,
     GetSymbolDefinition,
     FindSymbolReferences,
+    Diagnostics,
     
-    // Web
+    // Web & Documentation
     WebSearch,
     WebFetch,
+    FetchDocs,
     
-    // Mode control
+    // Interaction
+    AttemptCompletion,
+    AskFollowupQuestion,
+    Think,
+    
+    // Mode control (internal)
     PlanModeRespond,
     ActModeRespond,
     FocusChain,
@@ -59,15 +71,20 @@ impl Tool {
             Self::ReplaceInFile => "replace_in_file",
             Self::ApplyPatch => "apply_patch",
             Self::ListFiles => "list_files",
-            Self::SearchFiles => "search_files",
-            Self::AttemptCompletion => "attempt_completion",
-            Self::AskFollowupQuestion => "ask_followup_question",
+            Self::DeleteFile => "delete_file",
+            Self::Grep => "grep",
+            Self::Glob => "glob",
             Self::CodebaseSearch => "codebase_search",
             Self::ListCodeDefinitions => "list_code_definition_names",
             Self::GetSymbolDefinition => "get_symbol_definition",
             Self::FindSymbolReferences => "find_symbol_references",
+            Self::Diagnostics => "diagnostics",
             Self::WebSearch => "web_search",
             Self::WebFetch => "web_fetch",
+            Self::FetchDocs => "fetch_documentation",
+            Self::AttemptCompletion => "attempt_completion",
+            Self::AskFollowupQuestion => "ask_followup_question",
+            Self::Think => "think",
             Self::PlanModeRespond => "plan_mode_respond",
             Self::ActModeRespond => "act_mode_respond",
             Self::FocusChain => "focus_chain",
@@ -82,15 +99,20 @@ impl Tool {
             "replace_in_file" => Some(Self::ReplaceInFile),
             "apply_patch" => Some(Self::ApplyPatch),
             "list_files" => Some(Self::ListFiles),
-            "search_files" => Some(Self::SearchFiles),
-            "attempt_completion" => Some(Self::AttemptCompletion),
-            "ask_followup_question" => Some(Self::AskFollowupQuestion),
+            "delete_file" => Some(Self::DeleteFile),
+            "grep" => Some(Self::Grep),
+            "glob" => Some(Self::Glob),
             "codebase_search" => Some(Self::CodebaseSearch),
             "list_code_definition_names" => Some(Self::ListCodeDefinitions),
             "get_symbol_definition" => Some(Self::GetSymbolDefinition),
             "find_symbol_references" => Some(Self::FindSymbolReferences),
+            "diagnostics" => Some(Self::Diagnostics),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
+            "fetch_documentation" => Some(Self::FetchDocs),
+            "attempt_completion" => Some(Self::AttemptCompletion),
+            "ask_followup_question" => Some(Self::AskFollowupQuestion),
+            "think" => Some(Self::Think),
             "plan_mode_respond" => Some(Self::PlanModeRespond),
             "act_mode_respond" => Some(Self::ActModeRespond),
             "focus_chain" => Some(Self::FocusChain),
@@ -106,6 +128,7 @@ impl Tool {
                 | Self::WriteToFile
                 | Self::ReplaceInFile
                 | Self::ApplyPatch
+                | Self::DeleteFile
         )
     }
 }
@@ -139,6 +162,9 @@ impl ToolResult {
 
 /// Execute a tool call
 pub async fn execute(tool: &ToolCall, workdir: &Path, plan_mode: bool) -> ToolResult {
+    use std::time::Instant;
+    let start = Instant::now();
+    
     let Some(t) = Tool::from_name(&tool.name) else {
         return ToolResult::err(format!("Unknown tool: {}", tool.name));
     };
@@ -148,28 +174,42 @@ pub async fn execute(tool: &ToolCall, workdir: &Path, plan_mode: bool) -> ToolRe
         return ToolResult::err("Cannot modify files in plan mode");
     }
 
-    match t {
+    let result = match t {
         Tool::ExecuteCommand => execute::run(&tool.arguments, workdir).await,
         Tool::ReadFile => files::read(&tool.arguments, workdir).await,
         Tool::WriteToFile => files::write(&tool.arguments, workdir).await,
         Tool::ReplaceInFile => files::replace(&tool.arguments, workdir).await,
         Tool::ApplyPatch => files::apply_patch(&tool.arguments, workdir).await,
         Tool::ListFiles => files::list(&tool.arguments, workdir).await,
-        Tool::SearchFiles => search::grep(&tool.arguments, workdir).await,
+        Tool::DeleteFile => files::delete(&tool.arguments, workdir).await,
+        Tool::Grep => search::grep(&tool.arguments, workdir).await,
+        Tool::Glob => search::glob_search(&tool.arguments, workdir).await,
         Tool::CodebaseSearch => search::semantic(&tool.arguments, workdir).await,
         Tool::ListCodeDefinitions => code::list_definitions(&tool.arguments, workdir).await,
         Tool::GetSymbolDefinition => code::get_definition(&tool.arguments, workdir).await,
         Tool::FindSymbolReferences => code::find_references(&tool.arguments, workdir).await,
+        Tool::Diagnostics => lint::diagnostics(&tool.arguments, workdir).await,
         Tool::WebSearch => web::search(&tool.arguments).await,
         Tool::WebFetch => web::fetch(&tool.arguments).await,
+        Tool::FetchDocs => web::fetch_docs(&tool.arguments).await,
         
         // These are handled specially by the agent
         Tool::AttemptCompletion 
         | Tool::AskFollowupQuestion
         | Tool::PlanModeRespond
         | Tool::ActModeRespond
-        | Tool::FocusChain => ToolResult::ok(""),
+        | Tool::FocusChain
+        | Tool::Think => ToolResult::ok(""),
+    };
+    
+    let elapsed = start.elapsed();
+    if elapsed.as_millis() > 100 {
+        tracing::info!("⏱ Tool {} completed in {:?}", tool.name, elapsed);
+    } else {
+        tracing::debug!("⏱ Tool {} completed in {:?}", tool.name, elapsed);
     }
+    
+    result
 }
 
 /// Generate tool definitions for LLM
@@ -226,6 +266,18 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "apply_patch",
+            "description": "Apply a patch to one or more files. Supports two formats:\n1. V4A format (multi-file): Use 'input' parameter with *** Begin Patch / *** Update File: / *** End Patch markers\n2. Unified diff format (single file): Use 'path' and 'patch' parameters",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "V4A format patch with *** Begin Patch, *** Update File:, - removals, + additions" },
+                    "path": { "type": "string", "description": "Path to file (for unified diff format)" },
+                    "patch": { "type": "string", "description": "Unified diff patch content (for single file)" }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "list_files",
             "description": "List files in a directory",
             "parameters": {
@@ -238,28 +290,54 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "search_files",
-            "description": "Search for text patterns in files using regex",
+            "name": "delete_file",
+            "description": "Delete a file or empty directory. Protected paths like .git, node_modules, Cargo.toml cannot be deleted.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "Regex pattern to search" },
-                    "path": { "type": "string", "description": "Directory to search in" },
-                    "file_pattern": { "type": "string", "description": "Glob pattern for files (e.g., *.rs)" }
+                    "path": { "type": "string", "description": "Path to file or directory to delete" }
+                },
+                "required": ["path"]
+            }
+        }),
+        // SEARCH TOOLS - order matters for model selection
+        serde_json::json!({
+            "name": "codebase_search",
+            "description": "SEMANTIC/CONCEPTUAL search - find code by meaning. Use for understanding ('how does X work'), finding related code ('authentication logic'), or exploring unfamiliar areas. This is the PRIMARY search tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural language query describing what you're looking for" },
+                    "path": { "type": "string", "description": "Optional: limit search to directory" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "grep",
+            "description": "LITERAL text search - use ONLY when you know the exact string to find (specific function name, error message, import statement). Fast but requires exact match.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Exact text or regex pattern" },
+                    "path": { "type": "string", "description": "Directory to search (default: current)" },
+                    "glob": { "type": "string", "description": "File filter, e.g., '*.rs'" },
+                    "case_insensitive": { "type": "boolean", "description": "Ignore case" },
+                    "context": { "type": "integer", "description": "Context lines (0-5)" }
                 },
                 "required": ["pattern"]
             }
         }),
         serde_json::json!({
-            "name": "codebase_search",
-            "description": "Semantic search - find code by meaning, not exact text",
+            "name": "glob",
+            "description": "Find files by name/extension pattern. Returns file paths only.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural language query" },
-                    "path": { "type": "string", "description": "Directory to search" }
+                    "pattern": { "type": "string", "description": "Pattern like '*.rs', '**/*.test.ts'" },
+                    "path": { "type": "string", "description": "Base directory" }
                 },
-                "required": ["query"]
+                "required": ["pattern"]
             }
         }),
         serde_json::json!({
@@ -269,6 +347,46 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path" }
+                },
+                "required": ["path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "get_symbol_definition",
+            "description": "Go to the definition of a symbol. Uses LSP when available for accurate results, falls back to tree-sitter/regex search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "The symbol name to find the definition of" },
+                    "path": { "type": "string", "description": "File path where the symbol is used (for LSP lookup)" },
+                    "line": { "type": "integer", "description": "Line number (0-indexed) where the symbol appears" },
+                    "character": { "type": "integer", "description": "Character position (0-indexed) in the line" }
+                },
+                "required": ["symbol"]
+            }
+        }),
+        serde_json::json!({
+            "name": "find_symbol_references",
+            "description": "Find all references to a symbol across the codebase. Uses LSP when available for accurate results, falls back to regex search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "The symbol name to find references of" },
+                    "path": { "type": "string", "description": "File path where the symbol is defined (for LSP lookup)" },
+                    "line": { "type": "integer", "description": "Line number (0-indexed) where the symbol is defined" },
+                    "character": { "type": "integer", "description": "Character position (0-indexed) in the line" }
+                },
+                "required": ["symbol"]
+            }
+        }),
+        serde_json::json!({
+            "name": "diagnostics",
+            "description": "Get compiler/linter errors and warnings for a file or directory. Use this to check code for errors before or after making changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File or directory to check. For directories, runs the appropriate build tool (cargo check, tsc, etc.)" },
+                    "fix": { "type": "boolean", "description": "If true, attempt to auto-fix issues (when supported by the linter)" }
                 },
                 "required": ["path"]
             }
@@ -296,6 +414,18 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "fetch_documentation",
+            "description": "Fetch official library/framework documentation from Context7. PREFERRED over web_search for programming libraries. Use when you need API details, usage patterns, or aren't familiar with a library.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": { "type": "string", "description": "Library or framework name (e.g., 'react', 'tokio', 'fastapi')" },
+                    "topic": { "type": "string", "description": "Optional: specific topic to focus on (e.g., 'hooks', 'async', 'middleware')" }
+                },
+                "required": ["library"]
+            }
+        }),
+        serde_json::json!({
             "name": "ask_followup_question",
             "description": "Ask the user a clarifying question",
             "parameters": {
@@ -304,6 +434,17 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
                     "question": { "type": "string", "description": "The question to ask" }
                 },
                 "required": ["question"]
+            }
+        }),
+        serde_json::json!({
+            "name": "think",
+            "description": "Write out your reasoning or thoughts about the current task",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought": { "type": "string", "description": "Your reasoning or thoughts" }
+                },
+                "required": ["thought"]
             }
         }),
         serde_json::json!({

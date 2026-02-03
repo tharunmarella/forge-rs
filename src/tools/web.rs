@@ -1,5 +1,122 @@
 use super::ToolResult;
 use serde_json::Value;
+use std::time::Duration;
+
+const CONTEXT7_API_BASE: &str = "https://context7.com/api/v1";
+
+/// Fetch library documentation from Context7
+pub async fn fetch_docs(args: &Value) -> ToolResult {
+    let Some(library) = args.get("library").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'library' parameter");
+    };
+    
+    let topic = args.get("topic").and_then(|v| v.as_str());
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    
+    // Step 1: Search for the library
+    let search_query = if let Some(t) = topic {
+        format!("{} {}", library, t)
+    } else {
+        library.to_string()
+    };
+    
+    let search_url = format!(
+        "{}/search?query={}",
+        CONTEXT7_API_BASE,
+        urlencoding::encode(&search_query)
+    );
+    
+    let search_resp = match client
+        .get(&search_url)
+        .header("Accept", "application/json")
+        .header("User-Agent", "forge-cli/1.0")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ToolResult::err(format!("Search failed: {}", e)),
+    };
+    
+    if !search_resp.status().is_success() {
+        return ToolResult::err(format!("Context7 search failed: {}", search_resp.status()));
+    }
+    
+    #[derive(serde::Deserialize)]
+    struct SearchResult {
+        id: String,
+        title: String,
+        #[serde(default)]
+        description: String,
+        score: f64,
+    }
+    
+    #[derive(serde::Deserialize)]
+    struct SearchResponse {
+        #[serde(default)]
+        results: Vec<SearchResult>,
+    }
+    
+    let search_data: SearchResponse = match search_resp.json().await {
+        Ok(d) => d,
+        Err(e) => return ToolResult::err(format!("Failed to parse search results: {}", e)),
+    };
+    
+    if search_data.results.is_empty() {
+        return ToolResult::ok(format!("No documentation found for '{}'. Try a different library name or check spelling.", library));
+    }
+    
+    // Get top result
+    let top = &search_data.results[0];
+    
+    if top.score < 0.4 {
+        return ToolResult::ok(format!(
+            "No confident match for '{}'. Best guess: {} (score: {:.2})\nTry being more specific.",
+            library, top.title, top.score
+        ));
+    }
+    
+    // Step 2: Fetch the documentation
+    let doc_url = format!("{}/{}", CONTEXT7_API_BASE, top.id.trim_start_matches('/'));
+    
+    let doc_resp = match client
+        .get(&doc_url)
+        .header("Accept", "text/plain")
+        .header("User-Agent", "forge-cli/1.0")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ToolResult::err(format!("Failed to fetch docs: {}", e)),
+    };
+    
+    if !doc_resp.status().is_success() {
+        return ToolResult::err(format!("Failed to fetch documentation: {}", doc_resp.status()));
+    }
+    
+    let mut content = match doc_resp.text().await {
+        Ok(t) => t,
+        Err(e) => return ToolResult::err(format!("Failed to read documentation: {}", e)),
+    };
+    
+    // Truncate if too long
+    const MAX_DOC_LENGTH: usize = 15000;
+    if content.len() > MAX_DOC_LENGTH {
+        content.truncate(MAX_DOC_LENGTH);
+        content.push_str("\n\n... [Documentation truncated - use 'topic' parameter to focus on specific area]");
+    }
+    
+    ToolResult::ok(format!(
+        "# {} Documentation\n\nSource: {}\nRelevance: {:.0}%\n\n{}",
+        top.title,
+        top.id,
+        top.score * 100.0,
+        content
+    ))
+}
 
 /// Web search (uses DuckDuckGo HTML)
 pub async fn search(args: &Value) -> ToolResult {

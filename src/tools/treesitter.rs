@@ -127,10 +127,14 @@ fn collect_definitions(
             let start_line = node.start_position().row + 1;
             let end_line = node.end_position().row + 1;
             
-            // Get first line as signature
+            // Get first line as signature (handle UTF-8 boundaries safely)
             let start_byte = node.start_byte();
-            let end_byte = (start_byte + 200).min(content.len());
-            let sig = &content[start_byte..end_byte];
+            let mut end_byte = (start_byte + 200).min(content.len());
+            // Find a valid UTF-8 char boundary
+            while end_byte > start_byte && !content.is_char_boundary(end_byte) {
+                end_byte -= 1;
+            }
+            let sig = content.get(start_byte..end_byte).unwrap_or("");
             let signature = sig.lines().next().unwrap_or("").to_string();
             
             if !name.is_empty() {

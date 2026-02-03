@@ -61,14 +61,14 @@ pub fn start_background_indexing(workdir: std::path::PathBuf) {
     });
 }
 
-/// Grep search using regex
-pub async fn grep(args: &Value, workdir: &Path) -> ToolResult {
+/// Regex search (fallback when ripgrep not available)
+pub async fn files(args: &Value, workdir: &Path) -> ToolResult {
     let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'pattern' parameter");
     };
 
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let file_pattern = args.get("file_pattern").and_then(|v| v.as_str());
+    let file_pattern = args.get("file_pattern").and_then(|v| v.as_str()).or_else(|| args.get("glob").and_then(|v| v.as_str()));
 
     let regex = match Regex::new(pattern) {
         Ok(r) => r,
@@ -131,75 +131,147 @@ pub async fn grep(args: &Value, workdir: &Path) -> ToolResult {
     }
 }
 
-/// Semantic search using embeddings
+/// Semantic search using embeddings with SQLite persistence
 pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
     let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'query' parameter");
     };
 
-    // Try to use embedding store
-    let store_lock = get_store();
-    let mut store_guard = store_lock.write().await;
+    // Get configured provider
+    let provider = get_provider_config()
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or(EmbeddingProvider::Voyage);
     
-    // Initialize embedding store if needed
-    if store_guard.is_none() {
-        // Get configured provider or default to Voyage
-        let provider = get_provider_config()
-            .read()
-            .ok()
-            .and_then(|g| g.clone())
-            .unwrap_or(EmbeddingProvider::Voyage);
+    // Try to use persistent embedding database
+    let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("Failed to open embedding database: {}", e);
+            return keyword_search(query, workdir).await;
+        }
+    };
+    
+    // Check if we need to index (first time or few chunks)
+    let chunk_count = db.chunk_count().await;
+    if chunk_count < 10 {
+        tracing::info!("Embedding database has {} chunks, indexing workspace...", chunk_count);
         
+        // Create temp store for generating embeddings
         match EmbeddingStore::new(provider) {
             Ok(store) => {
-                // Index workspace in background
-                if let Err(e) = store.index_workspace(workdir).await {
-                    tracing::warn!("Failed to index workspace: {}", e);
+                let mut indexed = 0;
+                let mut files_indexed = 0;
+                
+                // Collect source files first
+                let source_files: Vec<_> = walkdir::WalkDir::new(workdir)
+                    .max_depth(8)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        let path_str = e.path().to_string_lossy();
+                        !path_str.contains("node_modules")
+                            && !path_str.contains("/target/")
+                            && !path_str.contains("/.git/")
+                            && !path_str.contains("/reference-repos/")
+                            && !path_str.contains("/__pycache__/")
+                    })
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .filter(|e| {
+                        let name = e.file_name().to_string_lossy();
+                        is_code_file(&name)
+                    })
+                    .take(200)
+                    .collect();
+                
+                tracing::info!("Found {} source files to index", source_files.len());
+                
+                for entry in source_files {
+                    let path = entry.path();
+                    
+                    match db.index_file(path, &store).await {
+                        Ok(n) => {
+                            indexed += n;
+                            if n > 0 {
+                                files_indexed += 1;
+                            }
+                        }
+                        Err(e) => tracing::warn!("Failed to index {}: {}", path.display(), e),
+                    }
                 }
-                *store_guard = Some(store);
+                tracing::info!("Indexed {} chunks from {} files to database", indexed, files_indexed);
             }
             Err(e) => {
                 tracing::warn!("Failed to create embedding store: {}", e);
-                // Fall back to keyword search
-                drop(store_guard);
-                return keyword_search(query, workdir).await;
-            }
-        }
-    }
-
-    // Search with embeddings
-    if let Some(store) = store_guard.as_ref() {
-        match store.search(query, 10).await {
-            Ok(results) => {
-                if results.is_empty() {
-                    return ToolResult::ok("No relevant code found");
-                }
-                
-                let output: Vec<String> = results
-                    .iter()
-                    .map(|(score, chunk)| {
-                        format!(
-                            "## {}:{}-{} (score: {:.2})\n```\n{}\n```",
-                            chunk.file_path,
-                            chunk.start_line,
-                            chunk.end_line,
-                            score,
-                            truncate_lines(&chunk.content, 15)
-                        )
-                    })
-                    .collect();
-                
-                return ToolResult::ok(output.join("\n\n"));
-            }
-            Err(e) => {
-                tracing::warn!("Embedding search failed: {}", e);
             }
         }
     }
     
-    // Fallback
-    drop(store_guard);
-    keyword_search(query, workdir).await
+    // Generate query embedding
+    let store = match EmbeddingStore::new(get_provider_config()
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or(EmbeddingProvider::Voyage)) 
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to create embedding store: {}", e);
+            return keyword_search(query, workdir).await;
+        }
+    };
+    
+    let query_embedding = match store.embed_texts_public(&[query]).await {
+        Ok(embs) if !embs.is_empty() => embs[0].clone(),
+        _ => {
+            tracing::warn!("Failed to embed query");
+            return keyword_search(query, workdir).await;
+        }
+    };
+    
+    // Search in database
+    match db.search(&query_embedding, 10).await {
+        Ok(results) => {
+            if results.is_empty() {
+                return ToolResult::ok("No relevant code found");
+            }
+            
+            let output: Vec<String> = results
+                .iter()
+                .map(|(score, chunk)| {
+                    let type_info = if let Some(ref name) = chunk.name {
+                        format!("{} `{}`", chunk.chunk_type, name)
+                    } else {
+                        chunk.chunk_type.clone()
+                    };
+                    format!(
+                        "## {}:{}-{} [{}] (score: {:.2})\n```\n{}\n```",
+                        chunk.file_path,
+                        chunk.start_line,
+                        chunk.end_line,
+                        type_info,
+                        score,
+                        truncate_lines(&chunk.content, 15)
+                    )
+                })
+                .collect();
+            
+            ToolResult::ok(output.join("\n\n"))
+        }
+        Err(e) => {
+            tracing::warn!("Database search failed: {}", e);
+            keyword_search(query, workdir).await
+        }
+    }
+}
+
+fn is_code_file(name: &str) -> bool {
+    let code_ext = [
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", 
+        ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
+    ];
+    code_ext.iter().any(|ext| name.ends_with(ext))
 }
 
 /// Fallback keyword search
@@ -281,6 +353,141 @@ fn is_binary_extension(name: &str) -> bool {
         ".wasm", ".o", ".a",
     ];
     binary_ext.iter().any(|ext| name.ends_with(ext))
+}
+
+/// Fast grep using ripgrep binary
+pub async fn grep(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'pattern' parameter");
+    };
+    
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let file_glob = args.get("glob").and_then(|v| v.as_str());
+    let case_insensitive = args.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let context_lines = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    
+    let search_path = workdir.join(path);
+    
+    // Build ripgrep command
+    let mut cmd = std::process::Command::new("rg");
+    cmd.arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color=never")
+        .arg("--max-count=100");  // Limit matches
+    
+    if case_insensitive {
+        cmd.arg("-i");
+    }
+    
+    if context_lines > 0 {
+        cmd.arg(format!("-C{}", context_lines.min(5)));
+    }
+    
+    if let Some(glob) = file_glob {
+        cmd.arg("-g").arg(glob);
+    }
+    
+    // Exclude common directories
+    cmd.arg("--glob=!node_modules")
+        .arg("--glob=!target")
+        .arg("--glob=!.git")
+        .arg("--glob=!*.lock");
+    
+    cmd.arg(pattern)
+        .arg(&search_path)
+        .current_dir(workdir);
+    
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() || output.status.code() == Some(1) {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.is_empty() {
+                    ToolResult::ok("No matches found")
+                } else {
+                    // Make paths relative
+                    let result = stdout
+                        .lines()
+                        .take(200)
+                        .map(|line| {
+                            if let Some(rel) = line.strip_prefix(&search_path.to_string_lossy().to_string()) {
+                                rel.trim_start_matches('/').to_string()
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ToolResult::ok(result)
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                ToolResult::err(format!("ripgrep error: {}", stderr))
+            }
+        }
+        Err(e) => {
+            // Fallback to regex search if rg not found
+            if e.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!("ripgrep not found, falling back to regex search");
+                return files(args, workdir).await;
+            }
+            ToolResult::err(format!("Failed to run ripgrep: {}", e))
+        }
+    }
+}
+
+/// Find files matching a glob pattern
+pub async fn glob_search(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'pattern' parameter");
+    };
+    
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let search_path = workdir.join(path);
+    
+    // Use glob crate or simple matching
+    let mut results = Vec::new();
+    let max_results = 100;
+    
+    // Handle common glob patterns
+    let is_recursive = pattern.contains("**");
+    let file_pattern = pattern.trim_start_matches("**/");
+    
+    let walker = if is_recursive {
+        WalkDir::new(&search_path).max_depth(10)
+    } else {
+        WalkDir::new(&search_path).max_depth(1)
+    };
+    
+    for entry in walker
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.') 
+                && name != "node_modules" 
+                && name != "target"
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let file_name = entry.file_name().to_string_lossy();
+        
+        // Simple glob matching
+        if glob_match(file_pattern, &file_name) {
+            let rel_path = entry.path().strip_prefix(workdir).unwrap_or(entry.path());
+            results.push(rel_path.display().to_string());
+            
+            if results.len() >= max_results {
+                results.push(format!("... (truncated at {} results)", max_results));
+                break;
+            }
+        }
+    }
+    
+    if results.is_empty() {
+        ToolResult::ok("No files found matching pattern")
+    } else {
+        ToolResult::ok(format!("Found {} files:\n{}", results.len(), results.join("\n")))
+    }
 }
 
 #[cfg(test)]

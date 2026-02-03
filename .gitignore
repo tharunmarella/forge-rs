@@ -2,3 +2,4 @@
 npm/bin/
 target/
 reference-repos/
+.forge/

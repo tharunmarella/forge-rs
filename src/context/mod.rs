@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
+use tokio::fs;
 use walkdir::WalkDir;
 
 /// Project context - files, structure, etc.
@@ -35,10 +36,11 @@ impl Context {
                 continue;
             }
 
-            // Count lines
-            let lines = std::fs::read_to_string(path)
-                .map(|c| c.lines().count())
-                .unwrap_or(0);
+            // Count lines asynchronously
+            let lines = match fs::read_to_string(path).await {
+                Ok(content) => content.lines().count(),
+                Err(_) => 0,
+            };
 
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let language = language_from_ext(ext);
@@ -142,6 +144,7 @@ fn is_ignored(path: &Path) -> bool {
         "node_modules", "target", "build", "dist", ".git",
         "__pycache__", ".pytest_cache", ".venv", "venv",
         "vendor", "coverage", ".next", ".nuxt",
+        "reference-repos", ".cargo", "pkg/mod",
     ];
     
     path.components().any(|c| {

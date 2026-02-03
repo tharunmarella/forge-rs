@@ -51,6 +51,14 @@ pub struct Config {
     /// Options: "auto", "whole-file", "search-replace", "unified-diff"
     #[serde(default)]
     pub edit_format: String,
+
+    /// Disable RepoMap building on startup
+    #[serde(default)]
+    pub no_repomap: bool,
+
+    /// Session timeout in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 fn default_max_retries() -> u32 {
@@ -209,6 +217,8 @@ impl Default for Config {
             self_correction: true, // Enable by default for local models
             max_retries: 3,
             edit_format: "auto".to_string(), // Auto-detect based on model
+            no_repomap: false,
+            timeout: None,
         }
     }
 }
@@ -305,14 +315,15 @@ impl Config {
         // Category-based approval
         match tool_name {
             // Read operations
-            "read_file" | "list_files" | "search_files" | "codebase_search" 
+            "read_file" | "list_files" | "codebase_search" 
             | "list_code_definition_names" | "get_symbol_definition" 
-            | "find_symbol_references" | "web_search" | "web_fetch" => {
+            | "find_symbol_references" | "web_search" | "web_fetch" | "fetch_documentation"
+            | "grep" | "glob" | "diagnostics" => {
                 self.auto_approve.read_operations
             }
             
             // Write operations
-            "write_to_file" | "replace_in_file" | "apply_patch" => {
+            "write_to_file" | "replace_in_file" | "apply_patch" | "delete_file" => {
                 self.auto_approve.write_operations
             }
             
@@ -321,8 +332,8 @@ impl Config {
                 self.auto_approve.commands
             }
             
-            // Always auto-approve these
-            "attempt_completion" | "ask_followup_question" 
+            // Always auto-approve these (no side effects)
+            "attempt_completion" | "ask_followup_question" | "think"
             | "plan_mode_respond" | "act_mode_respond" | "focus_chain" => true,
             
             _ => false,

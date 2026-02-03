@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod context7;
 mod edit_agent;
+mod lsp;
 mod repomap;
 mod session;
 mod setup;
@@ -54,6 +55,14 @@ struct Cli {
     /// Resume a specific session by ID
     #[arg(long)]
     session: Option<String>,
+
+    /// Disable building the RepoMap on startup
+    #[arg(long)]
+    no_repomap: bool,
+
+    /// Session timeout in seconds
+    #[arg(long)]
+    timeout: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -106,18 +115,23 @@ enum SessionAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let start_time = std::time::Instant::now();
     let cli = Cli::parse();
 
-    // Initialize logging
-    if cli.verbose {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
+    // Initialize logging - INFO level shows timing, DEBUG shows everything
+    use tracing_subscriber::EnvFilter;
+    let filter = if cli.verbose {
+        EnvFilter::new("debug")
     } else {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .init();
-    }
+        // Show timing info (INFO) by default, override with RUST_LOG env
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("forge=info,warn"))
+    };
+    
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .init();
 
     // Expand workdir
     let workdir = shellexpand::tilde(&cli.workdir).to_string();
@@ -155,6 +169,14 @@ async fn main() -> Result<()> {
         cfg.auto_approve.read_operations = true;
         cfg.auto_approve.write_operations = true;
         cfg.auto_approve.commands = true;
+    }
+
+    if cli.no_repomap {
+        cfg.no_repomap = true;
+    }
+
+    if let Some(timeout) = cli.timeout {
+        cfg.timeout = Some(timeout);
     }
 
     // Create checkpoint before starting

@@ -95,23 +95,37 @@ pub async fn complete(
     });
 
     let client = reqwest::Client::new();
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await?;
+    let mut attempts = 0;
+    let max_attempts = 3;
 
-    let status = response.status();
-    let body: Value = response.json().await?;
+    loop {
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?;
 
-    if !status.is_success() {
-        let error = body["error"]["message"].as_str().unwrap_or("Unknown error");
-        return Err(anyhow::anyhow!("OpenAI API error: {}", error));
+        let status = response.status();
+
+        if status.as_u16() == 429 && attempts < max_attempts {
+            attempts += 1;
+            let delay = std::time::Duration::from_secs(1 << (attempts - 1));
+            tracing::warn!("OpenAI API rate limited (429). Retrying in {:?} (attempt {}/{})", delay, attempts, max_attempts);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        let body: Value = response.json().await?;
+
+        if !status.is_success() {
+            let error = body["error"]["message"].as_str().unwrap_or("Unknown error");
+            return Err(anyhow::anyhow!("OpenAI API error: {}", error));
+        }
+
+        return parse_response(&body);
     }
-
-    parse_response(&body)
 }
 
 fn parse_response(body: &Value) -> Result<AgentResponse> {

@@ -363,30 +363,51 @@ impl RepoMap {
 
     /// Scan directory and build map for all source files
     pub fn build_from_directory(&mut self) -> String {
+        let start = Instant::now();
         let mut source_files: Vec<PathBuf> = Vec::new();
         
         let extensions = ["rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "cpp", "c", "h"];
+        const MAX_FILES: usize = 500; // Limit to prevent slowdown on huge repos
         
         for entry in WalkDir::new(&self.root)
+            .max_depth(10) // Limit directory depth
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            if source_files.len() >= MAX_FILES {
+                break;
+            }
+            
             let path = entry.path();
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if extensions.contains(&ext) {
                     // Skip common non-source directories
                     let path_str = path.to_string_lossy();
                     if !path_str.contains("node_modules") 
-                        && !path_str.contains("target")
-                        && !path_str.contains(".git")
-                        && !path_str.contains("vendor")
-                        && !path_str.contains("dist")
+                        && !path_str.contains("/target/")
+                        && !path_str.contains("/.git/")
+                        && !path_str.contains("/vendor/")
+                        && !path_str.contains("/dist/")
+                        && !path_str.contains("/build/")
+                        && !path_str.contains("/__pycache__/")
+                        && !path_str.contains("/.venv/")
+                        && !path_str.contains("/venv/")
+                        && !path_str.contains("/reference-repos/")
+                        && !path_str.contains("/.cargo/")
+                        && !path_str.contains("/pkg/mod/")
+                        && !path_str.contains("/test_data/")
+                        && !path_str.contains("/fixtures/")
                     {
                         source_files.push(path.to_path_buf());
                     }
                 }
             }
+        }
+        
+        let scan_time = start.elapsed();
+        if scan_time.as_millis() > 100 {
+            eprintln!("[RepoMap] Scanned {} files in {:?}", source_files.len(), scan_time);
         }
 
         self.build(&[], &source_files)

@@ -44,13 +44,29 @@ async fn stream_response(
     body: Value,
     tx: mpsc::Sender<StreamEvent>,
 ) -> Result<()> {
-    let response = client.post(url).json(&body).send().await?;
-    
-    if !response.status().is_success() {
-        let error: Value = response.json().await?;
-        let msg = error["error"]["message"].as_str().unwrap_or("Unknown error");
-        return Err(anyhow::anyhow!("Gemini API error: {}", msg));
-    }
+    let mut attempts = 0;
+    let max_attempts = 3;
+
+    let response = loop {
+        let response = client.post(url).json(&body).send().await?;
+        let status = response.status();
+
+        if status.as_u16() == 429 && attempts < max_attempts {
+            attempts += 1;
+            let delay = std::time::Duration::from_secs(1 << (attempts - 1));
+            tracing::warn!("Gemini API rate limited (429). Retrying in {:?} (attempt {}/{})", delay, attempts, max_attempts);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        if !status.is_success() {
+            let error: Value = response.json().await?;
+            let msg = error["error"]["message"].as_str().unwrap_or("Unknown error");
+            return Err(anyhow::anyhow!("Gemini API error: {}", msg));
+        }
+
+        break response;
+    };
 
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -114,17 +130,30 @@ pub async fn complete(
     let request = build_request(system_prompt, messages, tools, &config.model);
 
     let client = reqwest::Client::new();
-    let response = client.post(&url).json(&request).send().await?;
+    let mut attempts = 0;
+    let max_attempts = 3;
 
-    let status = response.status();
-    let body: Value = response.json().await?;
+    loop {
+        let response = client.post(&url).json(&request).send().await?;
+        let status = response.status();
 
-    if !status.is_success() {
-        let error = body["error"]["message"].as_str().unwrap_or("Unknown error");
-        return Err(anyhow::anyhow!("Gemini API error: {}", error));
+        if status.as_u16() == 429 && attempts < max_attempts {
+            attempts += 1;
+            let delay = std::time::Duration::from_secs(1 << (attempts - 1));
+            tracing::warn!("Gemini API rate limited (429). Retrying in {:?} (attempt {}/{})", delay, attempts, max_attempts);
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        let body: Value = response.json().await?;
+
+        if !status.is_success() {
+            let error = body["error"]["message"].as_str().unwrap_or("Unknown error");
+            return Err(anyhow::anyhow!("Gemini API error: {}", error));
+        }
+
+        return parse_response(&body);
     }
-
-    parse_response(&body)
 }
 
 fn build_request(system_prompt: &str, messages: &[Message], tools: &[Value], model: &str) -> Value {

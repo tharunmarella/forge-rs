@@ -149,25 +149,49 @@ impl Agent {
             tool_results: None,
         });
 
+        const MAX_ITERATIONS: usize = 50;
+        let mut iterations = 0;
+        let mut empty_responses = 0;
+        
         loop {
+            iterations += 1;
+            if iterations > MAX_ITERATIONS {
+                println!("\n\x1b[33m⚠️ Maximum iterations reached, stopping.\x1b[0m");
+                self.save_session().ok();
+                break;
+            }
+            
             let response = self.get_completion_streaming().await?;
             
             match response {
                 AgentResponse::Text(text) => {
-                    // Text already printed during streaming
-                    self.messages.push(Message {
-                        role: Role::Assistant,
-                        content: text,
-                        tool_calls: None,
-                        tool_results: None,
-                    });
+                    if !text.is_empty() {
+                        println!("{}", text);
+                        self.messages.push(Message {
+                            role: Role::Assistant,
+                            content: text,
+                            tool_calls: None,
+                            tool_results: None,
+                        });
+                        self.save_session().ok();
+                        break;
+                    } else {
+                        empty_responses += 1;
+                        if empty_responses > 3 {
+                            tracing::warn!("Multiple empty responses, stopping");
+                            break;
+                        }
+                    }
                 }
                 AgentResponse::ToolCalls { text, calls } => {
+                    empty_responses = 0;
+                    
                     if !text.is_empty() {
                         println!("{}", text);
                     }
                     
                     let mut results = Vec::new();
+                    let mut executed_calls = Vec::new();
                     
                     for call in &calls {
                         // Check auto-approval
@@ -182,6 +206,8 @@ impl Agent {
                             
                             if !input.trim().eq_ignore_ascii_case("y") {
                                 println!("Skipped");
+                                results.push((call.name.clone(), ToolResult::err("Tool skipped by user")));
+                                executed_calls.push(call.clone());
                                 continue;
                             }
                         } else {
@@ -197,21 +223,24 @@ impl Agent {
                         }
                         
                         results.push((call.name.clone(), result));
+                        executed_calls.push(call.clone());
                     }
                     
-                    self.messages.push(Message {
-                        role: Role::Assistant,
-                        content: String::new(),
-                        tool_calls: Some(calls.clone()),
-                        tool_results: None,
-                    });
-                    
-                    self.messages.push(Message {
-                        role: Role::Tool,
-                        content: String::new(),
-                        tool_calls: None,
-                        tool_results: Some(results),
-                    });
+                    if !executed_calls.is_empty() {
+                        self.messages.push(Message {
+                            role: Role::Assistant,
+                            content: text,
+                            tool_calls: Some(executed_calls),
+                            tool_results: None,
+                        });
+                        
+                        self.messages.push(Message {
+                            role: Role::Tool,
+                            content: String::new(),
+                            tool_calls: None,
+                            tool_results: Some(results),
+                        });
+                    }
                 }
                 AgentResponse::Completion(result) => {
                     println!("\n\x1b[32m✅ {result}\x1b[0m");
@@ -283,7 +312,14 @@ The following shows key symbols and their locations in the codebase:
 {repo_map_section}
 # Tools
 You have access to tools for file operations, code search, and web access.
-Use tools to accomplish tasks. Always read files before editing.
+
+## Search Strategy
+- `codebase_search`: Use for conceptual/semantic queries ("how does X work", "find code related to Y")
+- `grep`: Use ONLY for exact text/literal matches (function names, error strings, TODOs)
+- `glob`: Use to find files by name pattern (*.rs, test_*.py)
+- `get_symbol_definition`: Use to jump to a specific symbol's definition
+
+Always read files before editing.
 
 # Rules
 1. Be concise and direct
