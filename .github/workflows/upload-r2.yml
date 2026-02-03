@@ -1,0 +1,114 @@
+name: Upload to R2
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.4.1)'
+        required: true
+        type: string
+
+jobs:
+  upload-r2:
+    name: Upload to Cloudflare R2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          cd artifacts
+          
+          TAG="${{ steps.version.outputs.tag }}"
+          
+          # Download all release assets
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "*.tar.xz" \
+            --pattern "*.zip" \
+            --pattern "*.sha256" \
+            --pattern "sha256.sum"
+
+      - name: Create version file
+        run: |
+          echo "${{ steps.version.outputs.version }}" > artifacts/version.txt
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          pip install awscli
+          
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          echo "Uploading to forge-rs/v${VERSION}/"
+          
+          # Upload artifacts to versioned path
+          for file in artifacts/*; do
+            filename=$(basename "$file")
+            echo "  Uploading: $filename"
+            aws s3 cp "$file" "s3://prism-images/forge-rs/v${VERSION}/${filename}" \
+              --endpoint-url "$R2_ENDPOINT"
+          done
+          
+          echo "Uploading to forge-rs/latest/"
+          
+          # Also upload as 'latest'
+          for file in artifacts/*; do
+            filename=$(basename "$file")
+            aws s3 cp "$file" "s3://prism-images/forge-rs/latest/${filename}" \
+              --endpoint-url "$R2_ENDPOINT"
+          done
+          
+          echo "✅ Upload complete!"
+
+  update-install-script:
+    name: Update Install Script
+    needs: upload-r2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload install.sh to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          pip install awscli
+          
+          # Upload install script
+          aws s3 cp install.sh "s3://prism-images/forge-rs/install.sh" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "text/plain"
+          
+          echo "✅ Install script uploaded!"
