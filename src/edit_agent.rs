@@ -32,38 +32,71 @@ pub struct EditResult {
 }
 
 /// Edit format - different formats for different model capabilities
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EditFormat {
-    /// Output entire file (for weak models)
+    /// Output entire file (safest, works with any model)
     WholeFile,
-    /// Search/replace blocks (for medium models)
+    /// Search/replace blocks (good balance of precision and reliability)
     SearchReplace,
-    /// Unified diff format (for strong models)
+    /// Unified diff format (most efficient, requires capable model)
     UnifiedDiff,
+    /// Auto-detect based on model size hint in name
+    Auto,
+}
+
+impl Default for EditFormat {
+    fn default() -> Self {
+        EditFormat::SearchReplace // Best default - works with most models
+    }
 }
 
 impl EditFormat {
-    /// Choose format based on model capability
-    pub fn for_model(model: &str) -> Self {
-        // Strong models that can do diffs
-        if model.contains("opus") || 
-           model.contains("gpt-4") || 
-           model.contains("claude-3") ||
-           model.contains("70b") ||
-           model.contains("72b") {
+    /// Resolve Auto to a concrete format based on model name hints
+    /// Users can override by setting explicit format in config
+    pub fn resolve(self, model: &str) -> Self {
+        if self != EditFormat::Auto {
+            return self;
+        }
+        
+        let model_lower = model.to_lowercase();
+        
+        // Look for size hints in model name
+        // Large models (70B+) can do unified diff
+        if model_lower.contains("70b") || 
+           model_lower.contains("72b") ||
+           model_lower.contains("405b") {
             EditFormat::UnifiedDiff
         }
-        // Medium models - search/replace
-        else if model.contains("sonnet") ||
-                model.contains("32b") ||
-                model.contains("34b") ||
-                model.contains("codestral") ||
-                model.contains("deepseek") {
+        // Medium models (10B-40B) use search/replace
+        else if model_lower.contains("14b") ||
+                model_lower.contains("16b") ||
+                model_lower.contains("22b") ||
+                model_lower.contains("32b") ||
+                model_lower.contains("34b") {
             EditFormat::SearchReplace
         }
-        // Weak/small models - whole file
-        else {
+        // Small models or unknown - safest is whole file
+        else if model_lower.contains("7b") ||
+                model_lower.contains("8b") ||
+                model_lower.contains("3b") ||
+                model_lower.contains("1b") {
             EditFormat::WholeFile
+        }
+        // Default to search/replace for unknown models
+        else {
+            EditFormat::SearchReplace
+        }
+    }
+    
+    /// Parse from string (for CLI args)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "whole" | "whole-file" | "wholefile" => Some(EditFormat::WholeFile),
+            "search-replace" | "searchreplace" | "sr" => Some(EditFormat::SearchReplace),
+            "diff" | "unified-diff" | "udiff" => Some(EditFormat::UnifiedDiff),
+            "auto" => Some(EditFormat::Auto),
+            _ => None,
         }
     }
 }
@@ -75,9 +108,15 @@ pub struct EditAgent {
 }
 
 impl EditAgent {
+    /// Create with auto-detected format
     pub fn new(model: &str) -> Self {
+        Self::with_format(model, EditFormat::Auto)
+    }
+    
+    /// Create with explicit format
+    pub fn with_format(model: &str, format: EditFormat) -> Self {
         Self {
-            format: EditFormat::for_model(model),
+            format: format.resolve(model),
             model: model.to_string(),
         }
     }
@@ -86,7 +125,7 @@ impl EditAgent {
     fn build_system_prompt(&self) -> String {
         match self.format {
             EditFormat::WholeFile => WHOLE_FILE_SYSTEM_PROMPT.to_string(),
-            EditFormat::SearchReplace => SEARCH_REPLACE_SYSTEM_PROMPT.to_string(),
+            EditFormat::SearchReplace | EditFormat::Auto => SEARCH_REPLACE_SYSTEM_PROMPT.to_string(),
             EditFormat::UnifiedDiff => UNIFIED_DIFF_SYSTEM_PROMPT.to_string(),
         }
     }
@@ -156,6 +195,41 @@ Provide a unified diff (--- a/file, +++ b/file format) for the changes."#,
                 request.edit_description,
                 focus_hint
             ),
+            
+            EditFormat::Auto => {
+                // Should be resolved before reaching here, fallback to SearchReplace
+                self.build_edit_prompt_for_format(request, EditFormat::SearchReplace)
+            }
+        }
+    }
+    
+    fn build_edit_prompt_for_format(&self, request: &EditRequest, format: EditFormat) -> String {
+        let focus_hint = if let Some((start, end)) = request.focus_lines {
+            format!("\n\nFocus on lines {}-{}.", start, end)
+        } else {
+            String::new()
+        };
+        
+        match format {
+            EditFormat::SearchReplace | EditFormat::Auto => format!(
+                r#"# File: {}
+
+## Current Content:
+```
+{}
+```
+
+## Edit Instructions:
+{}{}
+
+## Output:
+Provide SEARCH/REPLACE blocks for each change needed."#,
+                request.file_path,
+                request.original_content,
+                request.edit_description,
+                focus_hint
+            ),
+            _ => self.build_edit_prompt(request),
         }
     }
 
@@ -163,7 +237,7 @@ Provide a unified diff (--- a/file, +++ b/file format) for the changes."#,
     pub fn parse_response(&self, response: &str, original: &str) -> Result<EditResult> {
         match self.format {
             EditFormat::WholeFile => self.parse_whole_file(response),
-            EditFormat::SearchReplace => self.parse_search_replace(response, original),
+            EditFormat::SearchReplace | EditFormat::Auto => self.parse_search_replace(response, original),
             EditFormat::UnifiedDiff => self.parse_unified_diff(response, original),
         }
     }
@@ -197,13 +271,12 @@ Provide a unified diff (--- a/file, +++ b/file format) for the changes."#,
 
         // Look for SEARCH/REPLACE patterns
         // Format: <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE
-        // Or: ```search ... ``` ```replace ... ```
         
         let lines: Vec<&str> = response.lines().collect();
         let mut i = 0;
         
         while i < lines.len() {
-            // Look for search block
+            // Look for search block start
             if lines[i].contains("SEARCH") || lines[i].contains("<<<<<<") {
                 let mut search_lines = Vec::new();
                 let mut replace_lines = Vec::new();
@@ -212,14 +285,19 @@ Provide a unified diff (--- a/file, +++ b/file format) for the changes."#,
                 i += 1;
                 while i < lines.len() {
                     let line = lines[i];
-                    if line.contains("=======") || line.contains("REPLACE") {
+                    
+                    // Check for separator
+                    if line.contains("=======") {
                         in_search = false;
                         i += 1;
                         continue;
                     }
-                    if line.contains(">>>>>>>") || (line.starts_with("```") && !in_search) {
+                    
+                    // Check for end marker
+                    if line.contains(">>>>>>>") || line.contains("REPLACE") && line.contains(">") {
                         break;
                     }
+                    
                     if in_search {
                         search_lines.push(line);
                     } else {
@@ -232,7 +310,7 @@ Provide a unified diff (--- a/file, +++ b/file format) for the changes."#,
                 let replace_text = replace_lines.join("\n");
                 
                 if !search_text.is_empty() && result.contains(&search_text) {
-                    result = result.replace(&search_text, &replace_text);
+                    result = result.replacen(&search_text, &replace_text, 1);
                     changes += 1;
                 }
             }
@@ -361,17 +439,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_selection() {
-        assert_eq!(EditFormat::for_model("gpt-4o"), EditFormat::UnifiedDiff);
-        assert_eq!(EditFormat::for_model("claude-sonnet-4"), EditFormat::SearchReplace);
-        assert_eq!(EditFormat::for_model("qwen2.5-coder:32b"), EditFormat::SearchReplace);
-        assert_eq!(EditFormat::for_model("llama3.2:latest"), EditFormat::WholeFile);
-        assert_eq!(EditFormat::for_model("qwen2.5-coder:7b"), EditFormat::WholeFile);
+    fn test_format_auto_resolution() {
+        // Large models -> UnifiedDiff
+        assert_eq!(EditFormat::Auto.resolve("llama-70b"), EditFormat::UnifiedDiff);
+        
+        // Medium models -> SearchReplace
+        assert_eq!(EditFormat::Auto.resolve("qwen2.5-coder:32b"), EditFormat::SearchReplace);
+        assert_eq!(EditFormat::Auto.resolve("model-14b"), EditFormat::SearchReplace);
+        
+        // Small models -> WholeFile
+        assert_eq!(EditFormat::Auto.resolve("llama-7b"), EditFormat::WholeFile);
+        assert_eq!(EditFormat::Auto.resolve("phi-3b"), EditFormat::WholeFile);
+        
+        // Unknown -> SearchReplace (safe default)
+        assert_eq!(EditFormat::Auto.resolve("some-unknown-model"), EditFormat::SearchReplace);
+        
+        // Explicit format is preserved
+        assert_eq!(EditFormat::WholeFile.resolve("llama-70b"), EditFormat::WholeFile);
+    }
+    
+    #[test]
+    fn test_format_from_str() {
+        assert_eq!(EditFormat::from_str("whole-file"), Some(EditFormat::WholeFile));
+        assert_eq!(EditFormat::from_str("search-replace"), Some(EditFormat::SearchReplace));
+        assert_eq!(EditFormat::from_str("diff"), Some(EditFormat::UnifiedDiff));
+        assert_eq!(EditFormat::from_str("auto"), Some(EditFormat::Auto));
+        assert_eq!(EditFormat::from_str("invalid"), None);
     }
 
     #[test]
     fn test_parse_whole_file() {
-        let agent = EditAgent::new("llama3.2");
+        // Explicitly use WholeFile format
+        let agent = EditAgent::with_format("any-model", EditFormat::WholeFile);
         let response = r#"Here's the updated file:
 
 ```rust
@@ -387,7 +486,8 @@ fn main() {
 
     #[test]
     fn test_parse_search_replace() {
-        let agent = EditAgent::new("qwen2.5-coder:32b");
+        // Explicitly use SearchReplace format
+        let agent = EditAgent::with_format("any-model", EditFormat::SearchReplace);
         let original = "fn main() {\n    println!(\"old\");\n}";
         let response = r#"
 <<<<<<< SEARCH
@@ -400,5 +500,107 @@ fn main() {
         assert!(result.success);
         assert!(result.new_content.contains("new"));
         assert!(!result.new_content.contains("old"));
+    }
+
+    #[test]
+    fn test_multiple_search_replace() {
+        let agent = EditAgent::with_format("any-model", EditFormat::SearchReplace);
+        let original = r#"fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn subtract(a: i32, b: i32) -> i32 {
+    a - b
+}"#;
+        let response = r#"I'll update both functions:
+
+<<<<<<< SEARCH
+fn add(a: i32, b: i32) -> i32 {
+=======
+fn add(a: i64, b: i64) -> i64 {
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+fn subtract(a: i32, b: i32) -> i32 {
+=======
+fn subtract(a: i64, b: i64) -> i64 {
+>>>>>>> REPLACE
+"#;
+        let result = agent.parse_response(response, original).unwrap();
+        assert!(result.success);
+        assert!(result.new_content.contains("i64"));
+        assert!(!result.new_content.contains("i32"));
+    }
+
+    #[test]
+    fn test_build_edit_prompt() {
+        let agent = EditAgent::with_format("any-model", EditFormat::SearchReplace);
+        let request = EditRequest {
+            file_path: "src/main.rs".to_string(),
+            original_content: "fn main() {}".to_string(),
+            edit_description: "Add hello world print".to_string(),
+            focus_lines: None,
+        };
+        
+        let prompt = agent.build_edit_prompt(&request);
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("fn main() {}"));
+        assert!(prompt.contains("Add hello world print"));
+        assert!(prompt.contains("SEARCH/REPLACE"));
+    }
+
+    #[test]
+    fn test_whole_file_with_language_tag() {
+        let agent = EditAgent::with_format("any-model", EditFormat::WholeFile);
+        let response = r#"```python
+def hello():
+    print("Hello!")
+```"#;
+        let result = agent.parse_response(response, "").unwrap();
+        assert!(result.success);
+        assert!(result.new_content.contains("def hello()"));
+    }
+
+    #[test]
+    fn test_real_world_edit() {
+        // Simulate a real-world edit scenario with explicit format
+        let agent = EditAgent::with_format("any-model", EditFormat::SearchReplace);
+        
+        let original = r#"use std::fs;
+
+fn read_config() -> String {
+    fs::read_to_string("config.txt").unwrap()
+}
+
+fn main() {
+    let config = read_config();
+    println!("{}", config);
+}"#;
+
+        // Simulate LLM response for "add error handling to read_config"
+        let response = r#"I'll add proper error handling:
+
+<<<<<<< SEARCH
+fn read_config() -> String {
+    fs::read_to_string("config.txt").unwrap()
+}
+=======
+fn read_config() -> Result<String, std::io::Error> {
+    fs::read_to_string("config.txt")
+}
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    let config = read_config();
+=======
+    let config = read_config().expect("Failed to read config");
+>>>>>>> REPLACE
+"#;
+
+        let result = agent.parse_response(response, original).unwrap();
+        assert!(result.success);
+        assert!(result.new_content.contains("Result<String, std::io::Error>"));
+        assert!(result.new_content.contains("expect(\"Failed to read config\")"));
+        println!("=== Edited Content ===\n{}", result.new_content);
     }
 }

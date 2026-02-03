@@ -46,6 +46,11 @@ pub struct Config {
     /// Max retries for self-correction
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    
+    /// Edit format for code modifications
+    /// Options: "auto", "whole-file", "search-replace", "unified-diff"
+    #[serde(default)]
+    pub edit_format: String,
 }
 
 fn default_max_retries() -> u32 {
@@ -203,6 +208,7 @@ impl Default for Config {
             ollama_url: None,
             self_correction: true, // Enable by default for local models
             max_retries: 3,
+            edit_format: "auto".to_string(), // Auto-detect based on model
         }
     }
 }
