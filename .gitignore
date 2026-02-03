@@ -3,3 +3,6 @@ npm/bin/
 target/
 reference-repos/
 .forge/
+
+models/
+test_embeddings.py

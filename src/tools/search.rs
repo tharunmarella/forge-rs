@@ -31,12 +31,14 @@ pub fn init_embedding_provider(provider: &str, api_key: Option<&str>, base_url: 
 /// Start background indexing of workspace (call on startup)
 pub fn start_background_indexing(workdir: std::path::PathBuf) {
     tokio::spawn(async move {
-        // Get configured provider or default to Voyage
+        // Get configured provider or default to local Ollama
         let provider = get_provider_config()
             .read()
             .ok()
             .and_then(|g| g.clone())
-            .unwrap_or(EmbeddingProvider::Voyage);
+            .unwrap_or(EmbeddingProvider::Ollama { 
+                base_url: "http://localhost:11434".to_string() 
+            });
 
         match EmbeddingStore::new(provider) {
             Ok(store) => {
@@ -142,7 +144,7 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
         .read()
         .ok()
         .and_then(|g| g.clone())
-        .unwrap_or(EmbeddingProvider::Voyage);
+        .unwrap_or(EmbeddingProvider::Ollama { base_url: "http://localhost:11434".to_string() });
     
     // Try to use persistent embedding database
     let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
@@ -213,7 +215,7 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
         .read()
         .ok()
         .and_then(|g| g.clone())
-        .unwrap_or(EmbeddingProvider::Voyage)) 
+        .unwrap_or(EmbeddingProvider::Ollama { base_url: "http://localhost:11434".to_string() })) 
     {
         Ok(s) => s,
         Err(e) => {
@@ -497,10 +499,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_embedding_provider() {
-        // Test Anthropic -> Voyage
+        // Test Anthropic -> Ollama (local embeddings)
         init_embedding_provider("anthropic", Some("test-key"), None);
         let provider = get_provider_config().read().unwrap();
-        assert!(matches!(provider.as_ref(), Some(EmbeddingProvider::Voyage)));
+        assert!(matches!(provider.as_ref(), Some(EmbeddingProvider::Ollama { .. })));
     }
 
     #[tokio::test]

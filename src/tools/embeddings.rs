@@ -6,21 +6,16 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use walkdir::WalkDir;
 
-/// Voyage API key (for Anthropic users who don't have native embeddings)
-const VOYAGE_API_KEY: &str = "pa-gfX4p_QdZ9UKoKsPEVB4fZDCj9E6ertbgLCudBKZqS1";
-
 /// Embedding provider type
 #[derive(Clone, Debug)]
 pub enum EmbeddingProvider {
-    /// Voyage AI (for Anthropic users)
-    Voyage,
     /// Gemini embeddings
     Gemini { api_key: String },
     /// OpenAI embeddings (works with OpenAI-compatible APIs)
     OpenAI { api_key: String, base_url: String },
-    /// Ollama local embeddings
+    /// Ollama local embeddings (free, works offline)
     Ollama { base_url: String },
-    /// Disabled (no embeddings)
+    /// Disabled (no embeddings - semantic search unavailable)
     None,
 }
 
@@ -28,7 +23,6 @@ impl EmbeddingProvider {
     /// Create provider based on LLM provider config
     pub fn from_config(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -> Self {
         match provider {
-            "anthropic" => EmbeddingProvider::Voyage,
             "gemini" => EmbeddingProvider::Gemini {
                 api_key: api_key.unwrap_or_default().to_string(),
             },
@@ -51,8 +45,14 @@ impl EmbeddingProvider {
             "ollama" => EmbeddingProvider::Ollama {
                 base_url: base_url.unwrap_or("http://localhost:11434").to_string(),
             },
-            // Default to Voyage (works without user API key)
-            _ => EmbeddingProvider::Voyage,
+            // Anthropic and others: try Ollama first, fall back to None
+            "anthropic" => EmbeddingProvider::Ollama {
+                base_url: "http://localhost:11434".to_string(),
+            },
+            // Default: try local Ollama (run `ollama pull nomic-embed-text` for semantic search)
+            _ => EmbeddingProvider::Ollama {
+                base_url: "http://localhost:11434".to_string(),
+            },
         }
     }
 }
@@ -96,7 +96,6 @@ impl EmbeddingStore {
         }
 
         match &self.provider {
-            EmbeddingProvider::Voyage => self.embed_voyage(texts).await,
             EmbeddingProvider::Gemini { api_key } => self.embed_gemini(texts, api_key).await,
             EmbeddingProvider::OpenAI { api_key, base_url } => {
                 self.embed_openai(texts, api_key, base_url).await
@@ -106,50 +105,9 @@ impl EmbeddingStore {
             }
             EmbeddingProvider::None => {
                 // Return zero vectors (embeddings disabled)
-                Ok(texts.iter().map(|_| vec![0.0; 384]).collect())
+                Ok(texts.iter().map(|_| vec![0.0; 768]).collect())
             }
         }
-    }
-
-    /// Voyage AI embeddings
-    async fn embed_voyage(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        #[derive(Serialize)]
-        struct VoyageRequest<'a> {
-            input: &'a [&'a str],
-            model: &'static str,
-            input_type: &'static str,
-        }
-
-        #[derive(Deserialize)]
-        struct VoyageResponse {
-            data: Vec<VoyageEmbedding>,
-        }
-
-        #[derive(Deserialize)]
-        struct VoyageEmbedding {
-            embedding: Vec<f32>,
-        }
-
-        let resp = self
-            .client
-            .post("https://api.voyageai.com/v1/embeddings")
-            .header("Authorization", format!("Bearer {}", VOYAGE_API_KEY))
-            .header("Content-Type", "application/json")
-            .json(&VoyageRequest {
-                input: texts,
-                model: "voyage-code-3",
-                input_type: "document",
-            })
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = resp.text().await?;
-            return Err(anyhow::anyhow!("Voyage API error: {}", err));
-        }
-
-        let response: VoyageResponse = resp.json().await?;
-        Ok(response.data.into_iter().map(|e| e.embedding).collect())
     }
 
     /// Gemini embeddings
