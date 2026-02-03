@@ -3,6 +3,7 @@ mod checkpoint;
 mod config;
 mod context;
 mod context7;
+mod edit_agent;
 mod repomap;
 mod session;
 mod setup;

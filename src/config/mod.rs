@@ -34,6 +34,22 @@ pub struct Config {
     pub together_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openrouter_api_key: Option<String>,
+    
+    /// Ollama URL (default: http://localhost:11434)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ollama_url: Option<String>,
+    
+    /// Enable self-correction loop (lint → fix → retry)
+    #[serde(default)]
+    pub self_correction: bool,
+    
+    /// Max retries for self-correction
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_max_retries() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +66,21 @@ pub struct ModelsConfig {
     pub together: Vec<String>,
     #[serde(default = "default_openrouter_models")]
     pub openrouter: Vec<String>,
+    #[serde(default = "default_ollama_models")]
+    pub ollama: Vec<String>,
+}
+
+fn default_ollama_models() -> Vec<String> {
+    vec![
+        "qwen2.5-coder:32b".into(),
+        "qwen2.5-coder:14b".into(),
+        "qwen2.5-coder:7b".into(),
+        "deepseek-coder-v2:16b".into(),
+        "codestral:22b".into(),
+        "llama3.3:70b".into(),
+        "llama3.2:latest".into(),
+        "mistral:latest".into(),
+    ]
 }
 
 fn default_gemini_models() -> Vec<String> {
@@ -112,6 +143,7 @@ impl Default for ModelsConfig {
             groq: default_groq_models(),
             together: default_together_models(),
             openrouter: default_openrouter_models(),
+            ollama: default_ollama_models(),
         }
     }
 }
@@ -168,6 +200,9 @@ impl Default for Config {
             groq_api_key: None,
             together_api_key: None,
             openrouter_api_key: None,
+            ollama_url: None,
+            self_correction: true, // Enable by default for local models
+            max_retries: 3,
         }
     }
 }
@@ -220,13 +255,19 @@ impl Config {
             "groq" => self.groq_api_key.as_deref(),
             "together" => self.together_api_key.as_deref(),
             "openrouter" => self.openrouter_api_key.as_deref(),
+            "ollama" => Some("ollama"), // Ollama doesn't need API key
             _ => None,
         }
     }
     
     /// Get the base URL for OpenAI-compatible APIs
     pub fn api_base_url(&self) -> Option<&str> {
-        self.base_url.as_deref()
+        if self.provider == "ollama" {
+            // Use configured Ollama URL or default
+            Some(self.ollama_url.as_deref().unwrap_or("http://localhost:11434/v1"))
+        } else {
+            self.base_url.as_deref()
+        }
     }
     
     /// Get available models for a provider
@@ -238,8 +279,14 @@ impl Config {
             "groq" => &self.models.groq,
             "together" => &self.models.together,
             "openrouter" => &self.models.openrouter,
+            "ollama" => &self.models.ollama,
             _ => &self.models.gemini,
         }
+    }
+    
+    /// Check if using a local model (Ollama)
+    pub fn is_local_model(&self) -> bool {
+        self.provider == "ollama"
     }
 
     /// Check if a tool should be auto-approved

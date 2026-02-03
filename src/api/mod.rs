@@ -248,8 +248,8 @@ impl Agent {
         match self.config.provider.as_str() {
             "gemini" => gemini::complete(&self.config, &system_prompt, &self.messages, &tool_defs).await,
             "anthropic" => anthropic::complete(&self.config, &system_prompt, &self.messages, &tool_defs).await,
-            // OpenAI and OpenAI-compatible providers
-            "openai" | "groq" | "together" | "openrouter" => {
+            // OpenAI and OpenAI-compatible providers (including Ollama)
+            "openai" | "groq" | "together" | "openrouter" | "ollama" => {
                 openai::complete(&self.config, &system_prompt, &self.messages, &tool_defs).await
             }
             _ => Err(anyhow::anyhow!("Unknown provider: {}", self.config.provider)),
