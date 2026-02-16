@@ -3,6 +3,38 @@ use serde_json::Value;
 use std::path::Path;
 use tokio::fs;
 use walkdir::WalkDir;
+use regex::Regex;
+
+// ══════════════════════════════════════════════════════════════════
+//  MULTI-STRATEGY EDIT MATCHING
+//  Ported from forge-ide: tries Exact -> Flexible -> Regex
+// ══════════════════════════════════════════════════════════════════
+
+/// Which replacement strategy succeeded.
+#[derive(Debug, Clone, Copy)]
+enum MatchStrategy {
+    Exact,
+    Flexible,
+    Regex,
+}
+
+impl std::fmt::Display for MatchStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatchStrategy::Exact => write!(f, "exact"),
+            MatchStrategy::Flexible => write!(f, "flexible"),
+            MatchStrategy::Regex => write!(f, "regex"),
+        }
+    }
+}
+
+/// Result of a successful replacement.
+struct ReplacementResult {
+    new_content: String,
+    #[allow(dead_code)]
+    occurrences: usize,
+    strategy: MatchStrategy,
+}
 
 /// Read file contents
 pub async fn read(args: &Value, workdir: &Path) -> ToolResult {
@@ -71,7 +103,178 @@ pub async fn write(args: &Value, workdir: &Path) -> ToolResult {
     }
 }
 
-/// Replace text in file
+/// Try all 3 strategies in order: exact -> flexible -> regex.
+/// Returns None if no strategy matched.
+fn try_replace(content: &str, old_str: &str, new_str: &str) -> Option<ReplacementResult> {
+    // Strategy 1: Exact match
+    if let Some(r) = try_exact_replace(content, old_str, new_str) {
+        return Some(r);
+    }
+    // Strategy 2: Flexible (whitespace-tolerant) match
+    if let Some(r) = try_flexible_replace(content, old_str, new_str) {
+        return Some(r);
+    }
+    // Strategy 3: Regex-based flexible match
+    if let Some(r) = try_regex_replace(content, old_str, new_str) {
+        return Some(r);
+    }
+    None
+}
+
+/// Strategy 1: Exact literal match (current behavior).
+fn try_exact_replace(content: &str, old_str: &str, new_str: &str) -> Option<ReplacementResult> {
+    let count = content.matches(old_str).count();
+    if count == 1 {
+        Some(ReplacementResult {
+            new_content: content.replacen(old_str, new_str, 1),
+            occurrences: 1,
+            strategy: MatchStrategy::Exact,
+        })
+    } else if count > 1 {
+        // Multiple matches -- can't use exact, but return None to try other strategies
+        None
+    } else {
+        None
+    }
+}
+
+/// Strategy 2: Flexible whitespace-tolerant match.
+/// Strips leading whitespace from each line, matches by trimmed content,
+/// then applies replacement preserving original indentation.
+fn try_flexible_replace(content: &str, old_str: &str, new_str: &str) -> Option<ReplacementResult> {
+    // Split source into lines preserving line endings
+    let source_lines: Vec<&str> = content.lines().collect();
+    let search_lines: Vec<&str> = old_str.lines().collect();
+    let replace_lines: Vec<&str> = new_str.lines().collect();
+
+    if search_lines.is_empty() {
+        return None;
+    }
+
+    let search_stripped: Vec<&str> = search_lines.iter().map(|l| l.trim()).collect();
+
+    let mut occurrences = 0;
+    let mut match_positions: Vec<usize> = Vec::new();
+
+    // Slide a window over source lines
+    if source_lines.len() >= search_stripped.len() {
+        for i in 0..=(source_lines.len() - search_stripped.len()) {
+            let window_stripped: Vec<&str> = source_lines[i..i + search_stripped.len()]
+                .iter()
+                .map(|l| l.trim())
+                .collect();
+            if window_stripped == search_stripped {
+                occurrences += 1;
+                match_positions.push(i);
+            }
+        }
+    }
+
+    if occurrences != 1 {
+        return None; // 0 or multiple matches
+    }
+
+    let pos = match_positions[0];
+
+    // Detect indentation from the first line of the match
+    let first_match_line = source_lines[pos];
+    let indentation = &first_match_line[..first_match_line.len() - first_match_line.trim_start().len()];
+
+    // Build replacement with original indentation
+    let indented_replacement: Vec<String> = replace_lines
+        .iter()
+        .enumerate()
+        .map(|(j, line)| {
+            if j == 0 && line.trim().is_empty() {
+                line.to_string()
+            } else {
+                format!("{}{}", indentation, line.trim_start())
+            }
+        })
+        .collect();
+
+    // Reconstruct content
+    let mut new_lines: Vec<String> = Vec::with_capacity(source_lines.len());
+    for line in &source_lines[..pos] {
+        new_lines.push(line.to_string());
+    }
+    for line in &indented_replacement {
+        new_lines.push(line.clone());
+    }
+    for line in &source_lines[pos + search_stripped.len()..] {
+        new_lines.push(line.to_string());
+    }
+
+    // Preserve trailing newline
+    let had_trailing_newline = content.ends_with('\n');
+    let mut new_content = new_lines.join("\n");
+    if had_trailing_newline && !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+
+    Some(ReplacementResult {
+        new_content,
+        occurrences: 1,
+        strategy: MatchStrategy::Flexible,
+    })
+}
+
+/// Strategy 3: Regex-based flexible match.
+/// Tokenizes old_str around delimiters, joins with \s*, matches with regex.
+fn try_regex_replace(content: &str, old_str: &str, new_str: &str) -> Option<ReplacementResult> {
+    let delimiters = ['(', ')', ':', '[', ']', '{', '}', '>', '<', '='];
+
+    // Tokenize: split around delimiters by inserting spaces around them
+    let mut processed = old_str.to_string();
+    for delim in &delimiters {
+        processed = processed.replace(*delim, &format!(" {} ", delim));
+    }
+
+    // Split by whitespace and filter empties
+    let tokens: Vec<&str> = processed.split_whitespace().filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // Escape each token for regex and join with \s*
+    let escaped: Vec<String> = tokens.iter().map(|t| regex::escape(t)).collect();
+    let pattern = format!(r"(?m)^(\s*){}", escaped.join(r"\s*"));
+
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+
+    let mat = re.find(content)?;
+
+    // Extract indentation from the match
+    let matched_text = mat.as_str();
+    let indentation = &matched_text[..matched_text.len() - matched_text.trim_start().len()];
+
+    // Build replacement with indentation
+    let replace_lines: Vec<&str> = new_str.lines().collect();
+    let indented: Vec<String> = replace_lines
+        .iter()
+        .map(|line| format!("{}{}", indentation, line))
+        .collect();
+    let replacement = indented.join("\n");
+
+    // Replace only the first occurrence
+    let new_content = format!(
+        "{}{}{}",
+        &content[..mat.start()],
+        replacement,
+        &content[mat.end()..],
+    );
+
+    Some(ReplacementResult {
+        new_content,
+        occurrences: 1,
+        strategy: MatchStrategy::Regex,
+    })
+}
+
+/// Replace text in file using multi-strategy matching
 pub async fn replace(args: &Value, workdir: &Path) -> ToolResult {
     let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'path' parameter");
@@ -84,32 +287,39 @@ pub async fn replace(args: &Value, workdir: &Path) -> ToolResult {
     };
 
     let full_path = workdir.join(path);
-
+    
     let content = match std::fs::read_to_string(&full_path) {
         Ok(c) => c,
         Err(e) => return ToolResult::err(format!("Failed to read {path}: {e}")),
     };
 
-    // Check for exact match
-    if !content.contains(old_str) {
-        return ToolResult::err(format!(
-            "old_str not found in {path}. Make sure it matches exactly including whitespace."
-        ));
-    }
-
-    // Count occurrences
-    let count = content.matches(old_str).count();
-    if count > 1 {
-        return ToolResult::err(format!(
-            "old_str found {count} times in {path}. It must be unique. Add more context."
-        ));
-    }
-
-    let new_content = content.replacen(old_str, new_str, 1);
-
-    match std::fs::write(&full_path, &new_content) {
-        Ok(_) => ToolResult::ok(format!("Updated {path}")),
-        Err(e) => ToolResult::err(format!("Failed to write: {e}")),
+    // Try multi-strategy replacement
+    match try_replace(&content, old_str, new_str) {
+        Some(result) => {
+            match std::fs::write(&full_path, &result.new_content) {
+                Ok(_) => ToolResult::ok(format!(
+                    "Replaced text in {path} using {} strategy", 
+                    result.strategy
+                )),
+                Err(e) => ToolResult::err(format!("Failed to write {path}: {e}")),
+            }
+        }
+        None => {
+            // Count exact matches for better error message
+            let exact_count = content.matches(old_str).count();
+            if exact_count == 0 {
+                ToolResult::err(format!(
+                    "String not found in {path}. Tried exact, flexible, and regex matching strategies."
+                ))
+            } else if exact_count > 1 {
+                ToolResult::err(format!(
+                    "Multiple matches ({}) found in {path}. Please provide more specific context to make the match unique.",
+                    exact_count
+                ))
+            } else {
+                ToolResult::err(format!("Failed to match text in {path} with any strategy"))
+            }
+        }
     }
 }
 

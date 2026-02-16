@@ -1,6 +1,7 @@
 use super::treesitter;
 use super::ToolResult;
 use crate::lsp::LspManager;
+use crate::code_graph::{trace, impact};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -8,6 +9,9 @@ use tokio::sync::Mutex;
 
 // Global LSP manager (lazy initialized)
 static LSP_MANAGER: OnceLock<Mutex<Option<LspManager>>> = OnceLock::new();
+
+// Global CodeGraph (lazy initialized)
+static CODE_GRAPH: OnceLock<Mutex<Option<crate::code_graph::CodeGraph>>> = OnceLock::new();
 
 /// Initialize or get the LSP manager
 async fn get_lsp_manager(workdir: &Path) -> Option<&'static Mutex<Option<LspManager>>> {
@@ -17,7 +21,56 @@ async fn get_lsp_manager(workdir: &Path) -> Option<&'static Mutex<Option<LspMana
     Some(manager)
 }
 
-/// List code definitions (functions, classes, etc.) using tree-sitter
+/// Get or initialize the code graph
+async fn get_code_graph(_workdir: &Path) -> Option<&'static Mutex<Option<crate::code_graph::CodeGraph>>> {
+    let graph = CODE_GRAPH.get_or_init(|| {
+        // In a real scenario, we would build the graph here using RepoMap
+        // For now, we return an empty graph that will be populated during indexing
+        Mutex::new(Some(crate::code_graph::CodeGraph::new()))
+    });
+    Some(graph)
+}
+
+/// Trace call chain upstream or downstream
+pub async fn trace_call_chain(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'symbol' parameter");
+    };
+
+    let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("downstream");
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+
+    if let Some(graph_lock) = get_code_graph(workdir).await {
+        let graph = graph_lock.lock().await;
+        if let Some(ref g) = *graph {
+            let result = trace::trace_calls(g, symbol, direction, max_depth);
+            return ToolResult::ok(serde_json::to_string_pretty(&result).unwrap_or_default());
+        }
+    }
+
+    ToolResult::err("Code graph not available")
+}
+
+/// Analyze impact of changing a symbol
+pub async fn impact_analysis(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'symbol' parameter");
+    };
+
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+
+    if let Some(graph_lock) = get_code_graph(workdir).await {
+        let graph = graph_lock.lock().await;
+        if let Some(ref g) = *graph {
+            let result = impact::analyze_impact(g, symbol, max_depth);
+            return ToolResult::ok(serde_json::to_string_pretty(&result).unwrap_or_default());
+        }
+    }
+
+    ToolResult::err("Code graph not available")
+}
+
+/// List code definitions (functions, classes, etc.) using LSP or tree-sitter
 pub async fn list_definitions(args: &Value, workdir: &Path) -> ToolResult {
     let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'path' parameter");
@@ -25,6 +78,16 @@ pub async fn list_definitions(args: &Value, workdir: &Path) -> ToolResult {
 
     let full_path = workdir.join(path);
     
+    // Try LSP first
+    if let Some(manager_lock) = get_lsp_manager(workdir).await {
+        let manager = manager_lock.lock().await;
+        if let Some(ref mgr) = *manager {
+            if let Some(symbols) = mgr.get_document_symbols(&full_path).await {
+                return ToolResult::ok(serde_json::to_string_pretty(&symbols).unwrap_or_default());
+            }
+        }
+    }
+
     let content = match std::fs::read_to_string(&full_path) {
         Ok(c) => c,
         Err(e) => return ToolResult::err(format!("Failed to read {path}: {e}")),

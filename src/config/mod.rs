@@ -35,9 +35,6 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openrouter_api_key: Option<String>,
     
-    /// Ollama URL (default: http://localhost:11434)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ollama_url: Option<String>,
     
     /// Enable self-correction loop (lint → fix → retry)
     #[serde(default)]
@@ -79,22 +76,10 @@ pub struct ModelsConfig {
     pub together: Vec<String>,
     #[serde(default = "default_openrouter_models")]
     pub openrouter: Vec<String>,
-    #[serde(default = "default_ollama_models")]
-    pub ollama: Vec<String>,
+    #[serde(default = "default_mlx_models")]
+    pub mlx: Vec<String>,
 }
 
-fn default_ollama_models() -> Vec<String> {
-    vec![
-        "qwen2.5-coder:32b".into(),
-        "qwen2.5-coder:14b".into(),
-        "qwen2.5-coder:7b".into(),
-        "deepseek-coder-v2:16b".into(),
-        "codestral:22b".into(),
-        "llama3.3:70b".into(),
-        "llama3.2:latest".into(),
-        "mistral:latest".into(),
-    ]
-}
 
 fn default_gemini_models() -> Vec<String> {
     vec![
@@ -147,6 +132,17 @@ fn default_openrouter_models() -> Vec<String> {
     ]
 }
 
+fn default_mlx_models() -> Vec<String> {
+    vec![
+        "mlx-community/Llama-3.2-3B-Instruct-4bit".into(),
+        "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
+        "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit".into(),
+        "mlx-community/CodeLlama-7b-Instruct-hf-4bit".into(),
+        "mlx-community/Llama-3.1-8B-Instruct-4bit".into(),
+        "mlx-community/Mistral-7B-Instruct-v0.3-4bit".into(),
+    ]
+}
+
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
@@ -156,7 +152,7 @@ impl Default for ModelsConfig {
             groq: default_groq_models(),
             together: default_together_models(),
             openrouter: default_openrouter_models(),
-            ollama: default_ollama_models(),
+            mlx: default_mlx_models(),
         }
     }
 }
@@ -213,7 +209,6 @@ impl Default for Config {
             groq_api_key: None,
             together_api_key: None,
             openrouter_api_key: None,
-            ollama_url: None,
             self_correction: true, // Enable by default for local models
             max_retries: 3,
             edit_format: "auto".to_string(), // Auto-detect based on model
@@ -231,7 +226,7 @@ impl Config {
             let contents = std::fs::read_to_string(&config_path)?;
             serde_json::from_str(&contents).unwrap_or_default()
         } else {
-            Self::default()
+            Self::default_with_auto_detection()
         };
 
         // Override with environment variables
@@ -246,6 +241,57 @@ impl Config {
         }
 
         Ok(config)
+    }
+    
+    /// Create default config with auto-detection of best available provider
+    pub fn default_with_auto_detection() -> Self {
+        let mut config = Self::default();
+        
+        // On macOS, prefer MLX if available (no API key required)
+        if cfg!(target_os = "macos") && Self::is_mlx_available() {
+            config.provider = "mlx".to_string();
+            config.model = "mlx-community/Llama-3.2-3B-Instruct-4bit".to_string();
+            return config;
+        }
+        
+        // Check for available API keys and prefer them in order of capability
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            config.provider = "anthropic".to_string();
+            config.model = "claude-sonnet-4-20250514".to_string();
+        } else if std::env::var("OPENAI_API_KEY").is_ok() {
+            config.provider = "openai".to_string();
+            config.model = "gpt-4o".to_string();
+        } else if std::env::var("GEMINI_API_KEY").is_ok() {
+            config.provider = "gemini".to_string();
+            config.model = "gemini-2.5-flash".to_string();
+        }
+        // Otherwise keep default (gemini)
+        
+        config
+    }
+    
+    /// Check if MLX is available on this system
+    pub fn is_mlx_available() -> bool {
+        // Check if we can find the MLX server script
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let script_path = current_dir.join("scripts").join("mlx_server.py");
+        
+        if !script_path.exists() {
+            return false;
+        }
+        
+        // Try to run a quick Python check for MLX availability
+        match std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import mlx.core; print('available')")
+            .output()
+        {
+            Ok(output) => {
+                output.status.success() && 
+                String::from_utf8_lossy(&output.stdout).contains("available")
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -271,19 +317,14 @@ impl Config {
             "groq" => self.groq_api_key.as_deref(),
             "together" => self.together_api_key.as_deref(),
             "openrouter" => self.openrouter_api_key.as_deref(),
-            "ollama" => Some("ollama"), // Ollama doesn't need API key
+            "mlx" => Some("mlx-local"), // MLX uses local server
             _ => None,
         }
     }
     
     /// Get the base URL for OpenAI-compatible APIs
     pub fn api_base_url(&self) -> Option<&str> {
-        if self.provider == "ollama" {
-            // Use configured Ollama URL or default
-            Some(self.ollama_url.as_deref().unwrap_or("http://localhost:11434/v1"))
-        } else {
-            self.base_url.as_deref()
-        }
+        self.base_url.as_deref()
     }
     
     /// Get available models for a provider
@@ -295,14 +336,14 @@ impl Config {
             "groq" => &self.models.groq,
             "together" => &self.models.together,
             "openrouter" => &self.models.openrouter,
-            "ollama" => &self.models.ollama,
+            "mlx" => &self.models.mlx,
             _ => &self.models.gemini,
         }
     }
     
-    /// Check if using a local model (Ollama)
+    /// Check if using a local model (MLX)
     pub fn is_local_model(&self) -> bool {
-        self.provider == "ollama"
+        matches!(self.provider.as_str(), "mlx")
     }
 
     /// Check if a tool should be auto-approved
@@ -318,17 +359,21 @@ impl Config {
             "read_file" | "list_files" | "codebase_search" 
             | "list_code_definition_names" | "get_symbol_definition" 
             | "find_symbol_references" | "web_search" | "web_fetch" | "fetch_documentation"
-            | "grep" | "glob" | "diagnostics" => {
+            | "grep" | "glob" | "diagnostics" | "check_process_status" | "read_process_output"
+            | "check_port" | "trace_call_chain" | "impact_analysis" | "scan_files"
+            | "list_traces" | "get_trace" | "trace_dashboard" | "generate_repo_map" => {
                 self.auto_approve.read_operations
             }
             
             // Write operations
-            "write_to_file" | "replace_in_file" | "apply_patch" | "delete_file" => {
+            "write_to_file" | "replace_in_file" | "apply_patch" | "delete_file"
+            | "kill_process" | "kill_port" | "index_files" | "reindex_workspace" 
+            | "watch_files" | "stop_watching" => {
                 self.auto_approve.write_operations
             }
             
             // Commands
-            "execute_command" => {
+            "execute_command" | "execute_background" | "wait_for_port" => {
                 self.auto_approve.commands
             }
             

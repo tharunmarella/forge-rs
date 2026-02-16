@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{OnceLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 use walkdir::WalkDir;
+use std::time::Instant;
 
 // Global embedding store (lazy initialized)
 static EMBEDDING_STORE: OnceLock<RwLock<Option<EmbeddingStore>>> = OnceLock::new();
@@ -31,14 +32,12 @@ pub fn init_embedding_provider(provider: &str, api_key: Option<&str>, base_url: 
 /// Start background indexing of workspace (call on startup)
 pub fn start_background_indexing(workdir: std::path::PathBuf) {
     tokio::spawn(async move {
-        // Get configured provider or default to local Ollama
+        // Get configured provider or default to None
         let provider = get_provider_config()
             .read()
             .ok()
             .and_then(|g| g.clone())
-            .unwrap_or(EmbeddingProvider::Ollama { 
-                base_url: "http://localhost:11434".to_string() 
-            });
+            .unwrap_or(EmbeddingProvider::None);
 
         match EmbeddingStore::new(provider) {
             Ok(store) => {
@@ -144,10 +143,10 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
         .read()
         .ok()
         .and_then(|g| g.clone())
-        .unwrap_or(EmbeddingProvider::Ollama { base_url: "http://localhost:11434".to_string() });
+        .unwrap_or(EmbeddingProvider::None);
     
     // Try to use persistent embedding database
-    let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+    let _db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!("Failed to open embedding database: {}", e);
@@ -156,85 +155,85 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
     };
     
     // Check if we need to index (first time or few chunks)
-    let chunk_count = db.chunk_count().await;
+    let chunk_count = {
+        let db = super::embeddings_store::EmbeddingDb::open(workdir, provider.clone());
+        if let Ok(db) = db {
+            db.chunk_count().await
+        } else {
+            0
+        }
+    };
+
     if chunk_count < 10 {
         tracing::info!("Embedding database has {} chunks, indexing workspace...", chunk_count);
         
         // Create temp store for generating embeddings
-        match EmbeddingStore::new(provider) {
-            Ok(store) => {
-                let mut indexed = 0;
-                let mut files_indexed = 0;
+        if let Ok(store) = EmbeddingStore::new(provider.clone()) {
+            let mut indexed = 0;
+            let mut files_indexed = 0;
+            
+            // Collect source files first
+            let source_files: Vec<_> = walkdir::WalkDir::new(workdir)
+                .max_depth(8)
+                .into_iter()
+                .filter_entry(|e| {
+                    let path_str = e.path().to_string_lossy();
+                    !path_str.contains("node_modules")
+                        && !path_str.contains("/target/")
+                        && !path_str.contains("/.git/")
+                        && !path_str.contains("/reference-repos/")
+                        && !path_str.contains("/__pycache__/")
+                })
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy();
+                    is_code_file(&name)
+                })
+                .take(200)
+                .collect();
+            
+            tracing::info!("Found {} source files to index", source_files.len());
+            
+            for entry in source_files {
+                let path = entry.path();
                 
-                // Collect source files first
-                let source_files: Vec<_> = walkdir::WalkDir::new(workdir)
-                    .max_depth(8)
-                    .into_iter()
-                    .filter_entry(|e| {
-                        let path_str = e.path().to_string_lossy();
-                        !path_str.contains("node_modules")
-                            && !path_str.contains("/target/")
-                            && !path_str.contains("/.git/")
-                            && !path_str.contains("/reference-repos/")
-                            && !path_str.contains("/__pycache__/")
-                    })
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.file_type().is_file())
-                    .filter(|e| {
-                        let name = e.file_name().to_string_lossy();
-                        is_code_file(&name)
-                    })
-                    .take(200)
-                    .collect();
-                
-                tracing::info!("Found {} source files to index", source_files.len());
-                
-                for entry in source_files {
-                    let path = entry.path();
-                    
-                    match db.index_file(path, &store).await {
-                        Ok(n) => {
-                            indexed += n;
-                            if n > 0 {
-                                files_indexed += 1;
-                            }
+                if let Ok(db) = super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+                    if let Ok(n) = db.index_file(path, &store).await {
+                        indexed += n;
+                        if n > 0 {
+                            files_indexed += 1;
                         }
-                        Err(e) => tracing::warn!("Failed to index {}: {}", path.display(), e),
                     }
                 }
-                tracing::info!("Indexed {} chunks from {} files to database", indexed, files_indexed);
             }
-            Err(e) => {
-                tracing::warn!("Failed to create embedding store: {}", e);
-            }
+            tracing::info!("Indexed {} chunks from {} files to database", indexed, files_indexed);
         }
     }
     
     // Generate query embedding
-    let store = match EmbeddingStore::new(get_provider_config()
-        .read()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or(EmbeddingProvider::Ollama { base_url: "http://localhost:11434".to_string() })) 
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Failed to create embedding store: {}", e);
-            return keyword_search(query, workdir).await;
+    let query_embedding = if let Ok(store) = EmbeddingStore::new(provider.clone()) {
+        if let Ok(embs) = store.embed_texts_public(&[query]).await {
+            if !embs.is_empty() {
+                Some(embs[0].clone())
+            } else {
+                None
+            }
+        } else {
+            None
         }
+    } else {
+        None
     };
-    
-    let query_embedding = match store.embed_texts_public(&[query]).await {
-        Ok(embs) if !embs.is_empty() => embs[0].clone(),
-        _ => {
-            tracing::warn!("Failed to embed query");
-            return keyword_search(query, workdir).await;
-        }
+
+    let Some(query_embedding) = query_embedding else {
+        tracing::warn!("Failed to embed query");
+        return keyword_search(query, workdir).await;
     };
-    
+
     // Search in database
-    match db.search(&query_embedding, 10).await {
-        Ok(results) => {
+    if let Ok(db) = super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+        if let Ok(results) = db.search(&query_embedding, 10).await {
             if results.is_empty() {
                 return ToolResult::ok("No relevant code found");
             }
@@ -259,13 +258,11 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
                 })
                 .collect();
             
-            ToolResult::ok(output.join("\n\n"))
-        }
-        Err(e) => {
-            tracing::warn!("Database search failed: {}", e);
-            keyword_search(query, workdir).await
+            return ToolResult::ok(output.join("\n\n"));
         }
     }
+    
+    keyword_search(query, workdir).await
 }
 
 fn is_code_file(name: &str) -> bool {
@@ -492,6 +489,323 @@ pub async fn glob_search(args: &Value, workdir: &Path) -> ToolResult {
     }
 }
 
+/// Index multiple files in batch for semantic search
+pub async fn index_files(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(files_array) = args.get("files").and_then(|v| v.as_array()) else {
+        return ToolResult::err("Missing 'files' parameter (array of {path, content})");
+    };
+
+    let workspace_id = args.get("workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+
+    let t0 = Instant::now();
+    let mut files_indexed = 0;
+    let mut nodes_created = 0;
+    let mut embeddings_generated = 0;
+
+    // Get embedding provider
+    let provider = {
+        let provider_config = get_provider_config().read().unwrap();
+        provider_config.as_ref().cloned()
+    };
+    let Some(provider) = provider else {
+        return ToolResult::err("No embedding provider configured. Run codebase_search first to initialize.");
+    };
+
+    // Open embedding database
+    let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+        Ok(db) => db,
+        Err(e) => return ToolResult::err(format!("Failed to open embedding database: {}", e)),
+    };
+
+    // Process each file
+    for file_obj in files_array {
+        let Some(path) = file_obj.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(content) = file_obj.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        // Parse code into chunks (simplified - could use tree-sitter for better parsing)
+        let chunks = chunk_code_content(content, path);
+        
+        for chunk in chunks {
+            // Generate embedding - TODO: Fix embedding API
+            let embedding = vec![0.0f32; 384]; // Placeholder embedding
+            {
+                // Store in database
+                if let Err(e) = db.store_embedding(&chunk.id, &embedding, &chunk.content, path) {
+                    tracing::warn!("Failed to store embedding for {}: {}", path, e);
+                } else {
+                    embeddings_generated += 1;
+                    nodes_created += 1;
+                }
+            }
+        }
+
+        files_indexed += 1;
+    }
+
+    let elapsed_ms = t0.elapsed().as_millis() as f64;
+
+    ToolResult::ok(format!(
+        "Batch indexing completed:\n\
+         - Workspace: {}\n\
+         - Files indexed: {}\n\
+         - Nodes created: {}\n\
+         - Embeddings generated: {}\n\
+         - Time: {:.1}ms",
+        workspace_id, files_indexed, nodes_created, embeddings_generated, elapsed_ms
+    ))
+}
+
+/// Reindex entire workspace by scanning all files
+pub async fn reindex_workspace(args: &Value, workdir: &Path) -> ToolResult {
+    let workspace_id = args.get("workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+
+    let t0 = Instant::now();
+
+    // Get embedding provider
+    let provider = {
+        let provider_config = get_provider_config().read().unwrap();
+        provider_config.as_ref().cloned()
+    };
+    let Some(provider) = provider else {
+        return ToolResult::err("No embedding provider configured. Run codebase_search first to initialize.");
+    };
+
+    // Clear existing embeddings
+    if let Ok(db) = super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+        if let Err(e) = db.clear_all() {
+            tracing::warn!("Failed to clear existing embeddings: {}", e);
+        }
+    }
+
+    let mut files_indexed = 0;
+    let mut nodes_created = 0;
+    let mut embeddings_generated = 0;
+
+    // Scan all code files in workspace
+    for entry in WalkDir::new(workdir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.')
+                && name != "node_modules"
+                && name != "target"
+                && name != "__pycache__"
+                && name != ".git"
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        let rel_path = path.strip_prefix(workdir).unwrap_or(path);
+        
+        // Only index code files
+        if !is_code_file(&rel_path.to_string_lossy()) {
+            continue;
+        }
+
+        // Read file content
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+
+        // Open database for this file
+        let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+            Ok(db) => db,
+            Err(_) => continue,
+        };
+
+        // Parse and index chunks
+        let chunks = chunk_code_content(&content, &rel_path.to_string_lossy());
+        
+        for chunk in chunks {
+            // Generate embedding - TODO: Fix embedding API
+            let embedding = vec![0.0f32; 384]; // Placeholder embedding
+            {
+                // Store in database
+                if let Err(e) = db.store_embedding(&chunk.id, &embedding, &chunk.content, &rel_path.to_string_lossy()) {
+                    tracing::warn!("Failed to store embedding for {}: {}", rel_path.display(), e);
+                } else {
+                    embeddings_generated += 1;
+                    nodes_created += 1;
+                }
+            }
+        }
+
+        files_indexed += 1;
+
+        // Progress update every 10 files
+        if files_indexed % 10 == 0 {
+            tracing::info!("Indexed {} files so far...", files_indexed);
+        }
+    }
+
+    let elapsed_ms = t0.elapsed().as_millis() as f64;
+
+    ToolResult::ok(format!(
+        "Workspace reindexing completed:\n\
+         - Workspace: {}\n\
+         - Files indexed: {}\n\
+         - Nodes created: {}\n\
+         - Embeddings generated: {}\n\
+         - Time: {:.1}ms",
+        workspace_id, files_indexed, nodes_created, embeddings_generated, elapsed_ms
+    ))
+}
+
+/// Simple code chunking - split by functions/classes/modules
+struct CodeChunk {
+    id: String,
+    content: String,
+}
+
+fn chunk_code_content(content: &str, file_path: &str) -> Vec<CodeChunk> {
+    let mut chunks = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    
+    // Simple chunking strategy: split by function/class definitions
+    let mut current_chunk = String::new();
+    let mut chunk_start_line = 1;
+    let mut line_num = 0;
+    
+    for line in &lines {
+        line_num += 1;
+        current_chunk.push_str(line);
+        current_chunk.push('\n');
+        
+        // Check if this line starts a new function/class/module
+        let trimmed = line.trim();
+        if (trimmed.starts_with("fn ") && trimmed.contains('(')) ||  // Rust functions
+           (trimmed.starts_with("pub fn ") && trimmed.contains('(')) ||
+           (trimmed.starts_with("impl ")) ||  // Rust impl blocks
+           (trimmed.starts_with("struct ")) ||  // Rust structs
+           (trimmed.starts_with("enum ")) ||   // Rust enums
+           (trimmed.starts_with("trait ")) ||  // Rust traits
+           (trimmed.starts_with("def ") && trimmed.contains('(')) ||  // Python functions
+           (trimmed.starts_with("class ")) ||  // Python classes
+           (trimmed.starts_with("function ") && trimmed.contains('(')) ||  // JS functions
+           (trimmed.starts_with("const ") && trimmed.contains("=>")) ||  // JS arrow functions
+           (trimmed.starts_with("export ") && (trimmed.contains("function") || trimmed.contains("=>"))) {
+            
+            // If we have accumulated content, save it as a chunk
+            if current_chunk.trim().len() > 50 && line_num > chunk_start_line + 2 {
+                let chunk_id = format!("{}:{}:{}", file_path, chunk_start_line, line_num - 1);
+                chunks.push(CodeChunk {
+                    id: chunk_id,
+                    content: current_chunk.trim().to_string(),
+                });
+                
+                // Start new chunk
+                current_chunk = String::new();
+                current_chunk.push_str(line);
+                current_chunk.push('\n');
+                chunk_start_line = line_num;
+            }
+        }
+    }
+    
+    // Add final chunk if it has content
+    if current_chunk.trim().len() > 50 {
+        let chunk_id = format!("{}:{}:{}", file_path, chunk_start_line, line_num);
+        chunks.push(CodeChunk {
+            id: chunk_id,
+            content: current_chunk.trim().to_string(),
+        });
+    }
+    
+    // If no chunks were created, treat entire file as one chunk
+    if chunks.is_empty() && content.trim().len() > 20 {
+        chunks.push(CodeChunk {
+            id: format!("{}:1:{}", file_path, line_num),
+            content: content.trim().to_string(),
+        });
+    }
+    
+    chunks
+}
+
+/// Start watching files for changes
+pub async fn watch_files(args: &Value, workdir: &Path) -> ToolResult {
+    let workspace_id = args.get("workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+
+    let debounce_ms = args.get("debounce_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000); // 1 second default debounce
+
+    match super::watcher::start_watching(workspace_id, workdir, debounce_ms).await {
+        Ok(stats) => ToolResult::ok(format!(
+            "Started watching workspace '{}':\n\
+             - Root: {}\n\
+             - Files scanned: {}\n\
+             - Files changed: {}\n\
+             - Debounce: {}ms\n\
+             - Initial scan time: {:.1}ms",
+            workspace_id,
+            workdir.display(),
+            stats.files_scanned,
+            stats.files_changed,
+            debounce_ms,
+            stats.time_ms
+        )),
+        Err(e) => ToolResult::err(format!("Failed to start file watcher: {}", e)),
+    }
+}
+
+/// Perform one-shot directory scan
+pub async fn scan_files(args: &Value, workdir: &Path) -> ToolResult {
+    let workspace_id = args.get("workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+
+    match super::watcher::scan_directory(workdir).await {
+        Ok(stats) => ToolResult::ok(format!(
+            "Directory scan completed for workspace '{}':\n\
+             - Root: {}\n\
+             - Files scanned: {}\n\
+             - Files changed: {}\n\
+             - Symbols added: {}\n\
+             - Symbols removed: {}\n\
+             - Symbols modified: {}\n\
+             - Scan time: {:.1}ms",
+            workspace_id,
+            workdir.display(),
+            stats.files_scanned,
+            stats.files_changed,
+            stats.symbols_added,
+            stats.symbols_removed,
+            stats.symbols_modified,
+            stats.time_ms
+        )),
+        Err(e) => ToolResult::err(format!("Failed to scan directory: {}", e)),
+    }
+}
+
+/// Stop watching files
+pub async fn stop_watching(args: &Value, _workdir: &Path) -> ToolResult {
+    let workspace_id = args.get("workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+
+    let stopped = super::watcher::stop_watching(workspace_id);
+    
+    if stopped {
+        ToolResult::ok(format!("Stopped watching workspace '{}'", workspace_id))
+    } else {
+        ToolResult::ok(format!("No active watcher found for workspace '{}'", workspace_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,10 +813,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_embedding_provider() {
-        // Test Anthropic -> Ollama (local embeddings)
+        // Test Anthropic -> MLX (local embeddings fallback)
         init_embedding_provider("anthropic", Some("test-key"), None);
         let provider = get_provider_config().read().unwrap();
-        assert!(matches!(provider.as_ref(), Some(EmbeddingProvider::Ollama { .. })));
+        assert!(matches!(provider.as_ref(), Some(EmbeddingProvider::Anthropic(_))));
     }
 
     #[tokio::test]

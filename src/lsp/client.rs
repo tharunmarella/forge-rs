@@ -288,6 +288,17 @@ impl LspClient {
         
         Ok(None)
     }
+
+    /// Get document symbols
+    pub async fn document_symbols(&self, file_path: &Path) -> Result<Value> {
+        self.open_file(file_path)?;
+        
+        self.send_request("textDocument/documentSymbol", json!({
+            "textDocument": {
+                "uri": format!("file://{}", file_path.display())
+            }
+        })).await
+    }
     
     /// Shutdown the language server
     pub async fn shutdown(&self) -> Result<()> {

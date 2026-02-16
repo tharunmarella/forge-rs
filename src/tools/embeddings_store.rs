@@ -8,15 +8,14 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 use super::embeddings::{EmbeddingProvider, EmbeddingStore};
 use super::treesitter;
 
 /// Persistent embedding database
 pub struct EmbeddingDb {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
     provider: EmbeddingProvider,
     workdir: PathBuf,
 }
@@ -72,7 +71,7 @@ impl EmbeddingDb {
         "#)?;
         
         Ok(Self {
-            conn: Arc::new(RwLock::new(conn)),
+            conn: Arc::new(Mutex::new(conn)),
             provider,
             workdir: workdir.to_path_buf(),
         })
@@ -80,7 +79,7 @@ impl EmbeddingDb {
     
     /// Check if a file needs re-indexing based on content hash
     pub async fn needs_reindex(&self, file_path: &str, content_hash: &str) -> bool {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().unwrap();
         let result: Result<String, _> = conn.query_row(
             "SELECT file_hash FROM file_index WHERE file_path = ?",
             params![file_path],
@@ -135,14 +134,14 @@ impl EmbeddingDb {
         
         // Delete old chunks for this file
         {
-            let conn = self.conn.write().await;
+            let conn = self.conn.lock().unwrap();
             conn.execute("DELETE FROM chunks WHERE file_path = ?", params![rel_path])?;
         }
         
         // Insert new chunks
         let mut indexed = 0;
         {
-            let conn = self.conn.write().await;
+            let conn = self.conn.lock().unwrap();
             for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
                 let embedding_blob = embedding_to_blob(embedding);
                 conn.execute(
@@ -174,26 +173,36 @@ impl EmbeddingDb {
     
     /// Search for similar chunks
     pub async fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<(f32, StoredChunk)>> {
-        let conn = self.conn.read().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, file_path, chunk_type, name, start_line, end_line, content, embedding, file_hash 
-             FROM chunks WHERE embedding IS NOT NULL"
-        )?;
-        
-        let chunks: Vec<StoredChunk> = stmt.query_map([], |row| {
-            let embedding_blob: Vec<u8> = row.get(7)?;
-            Ok(StoredChunk {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                chunk_type: row.get(2)?,
-                name: row.get(3)?,
-                start_line: row.get(4)?,
-                end_line: row.get(5)?,
-                content: row.get(6)?,
-                embedding: blob_to_embedding(&embedding_blob),
-                file_hash: row.get(8)?,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let chunks: Vec<StoredChunk> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, file_path, chunk_type, name, start_line, end_line, content, embedding, file_hash 
+                 FROM chunks WHERE embedding IS NOT NULL"
+            )?;
+            
+            let rows = stmt.query_map([], |row| {
+                let embedding_blob: Vec<u8> = row.get(7)?;
+                Ok(StoredChunk {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    chunk_type: row.get(2)?,
+                    name: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    content: row.get(6)?,
+                    embedding: blob_to_embedding(&embedding_blob),
+                    file_hash: row.get(8)?,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                if let Ok(chunk) = row {
+                    results.push(chunk);
+                }
+            }
+            results
+        };
         
         // Compute similarities and sort
         let mut results: Vec<(f32, StoredChunk)> = chunks
@@ -211,16 +220,54 @@ impl EmbeddingDb {
     
     /// Get total chunk count
     pub async fn chunk_count(&self) -> usize {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap_or(0)
     }
     
     /// Get indexed file count
     pub async fn file_count(&self) -> usize {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM file_index", [], |row| row.get(0))
             .unwrap_or(0)
+    }
+
+    /// Store a single embedding with metadata
+    pub fn store_embedding(&self, chunk_id: &str, embedding: &[f32], content: &str, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Convert embedding to blob
+        let embedding_blob = embedding_to_blob(embedding);
+        
+        // Parse chunk_id to extract line numbers (format: "path:start:end")
+        let parts: Vec<&str> = chunk_id.split(':').collect();
+        let start_line = if parts.len() >= 2 { parts[parts.len()-2].parse().unwrap_or(1) } else { 1 };
+        let end_line = if parts.len() >= 3 { parts[parts.len()-1].parse().unwrap_or(start_line) } else { start_line };
+        
+        conn.execute(
+            "INSERT INTO chunks (file_path, chunk_type, name, start_line, end_line, content, embedding, file_hash) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                file_path,
+                "function", // default chunk type
+                "", // no specific name
+                start_line,
+                end_line,
+                content,
+                embedding_blob,
+                "batch_indexed" // placeholder hash
+            ],
+        )?;
+        
+        Ok(())
+    }
+
+    /// Clear all embeddings from the database
+    pub fn clear_all(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM chunks", [])?;
+        conn.execute("DELETE FROM file_index", [])?;
+        Ok(())
     }
 }
 

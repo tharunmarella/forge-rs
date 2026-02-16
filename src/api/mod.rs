@@ -1,9 +1,8 @@
-pub mod gemini;
-pub mod anthropic;
-pub mod openai;
-pub mod streaming;
-
-pub use streaming::{StreamEvent, StreamReceiver};
+use crate::llm::{self, tools::ForgeToolAdapter};
+use rig::completion::{Chat, Message as RigMessage};
+use rig::agent::Agent as RigAgent;
+use rig::tool::ToolDyn;
+use rig::providers::{openai, anthropic, gemini};
 
 use crate::config::Config;
 use crate::context::Context;
@@ -14,7 +13,6 @@ use crate::tools::{self, ToolCall, ToolResult};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::io::{stdout, Write};
 
 /// Message in conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +34,13 @@ pub enum Role {
     Tool,
 }
 
+pub enum RigAgentEnum {
+    OpenAI(RigAgent<openai::responses_api::ResponsesCompletionModel>),
+    Anthropic(RigAgent<anthropic::completion::CompletionModel>),
+    Gemini(RigAgent<gemini::completion::CompletionModel>),
+    MLX(RigAgent<openai::responses_api::ResponsesCompletionModel>),
+}
+
 /// The main agent that orchestrates everything
 pub struct Agent {
     pub config: Config,
@@ -45,6 +50,7 @@ pub struct Agent {
     doc_prefetcher: DocPrefetcher,
     repo_map: String,
     session: Option<Session>,
+    pub rig_agent: Option<RigAgentEnum>,
 }
 
 impl Agent {
@@ -65,10 +71,15 @@ impl Agent {
         // Start background indexing
         tools::start_background_indexing(workdir.clone());
         
+        // Initialize trace system
+        if let Err(e) = crate::tools::trace::initialize().await {
+            tracing::warn!("Failed to initialize trace system: {}", e);
+        }
+        
         // Create new session
         let session = Session::new(workdir.clone(), &config.provider, &config.model);
         
-        Ok(Self {
+        let mut agent = Self {
             config,
             workdir,
             context,
@@ -76,9 +87,70 @@ impl Agent {
             doc_prefetcher: DocPrefetcher::new(),
             repo_map,
             session: Some(session),
-        })
+            rig_agent: None,
+        };
+        
+        agent.init_rig_agent().await?;
+        
+        Ok(agent)
     }
     
+    async fn init_rig_agent(&mut self) -> Result<()> {
+        // Add tools
+        let tool_defs = tools::definitions(self.config.plan_mode);
+        let mut rig_tools: Vec<Box<dyn ToolDyn>> = Vec::new();
+        
+        for def in tool_defs {
+            let name = def["name"].as_str().unwrap().to_string();
+            let description = def["description"].as_str().unwrap().to_string();
+            let parameters = def["parameters"].clone();
+            
+            rig_tools.push(Box::new(ForgeToolAdapter {
+                name,
+                description,
+                parameters,
+                workdir: self.workdir.clone(),
+                plan_mode: self.config.plan_mode,
+            }));
+        }
+        
+        let preamble = self.build_system_prompt();
+        
+        match self.config.provider.as_str() {
+            "openai" | "groq" | "together" | "openrouter" => {
+                let rig_agent = llm::create_openai_agent_builder(&self.config)?
+                    .preamble(&preamble)
+                    .tools(rig_tools)
+                    .build();
+                self.rig_agent = Some(RigAgentEnum::OpenAI(rig_agent));
+            }
+            "anthropic" => {
+                let rig_agent = llm::create_anthropic_agent_builder(&self.config)?
+                    .preamble(&preamble)
+                    .tools(rig_tools)
+                    .build();
+                self.rig_agent = Some(RigAgentEnum::Anthropic(rig_agent));
+            }
+            "gemini" => {
+                let rig_agent = llm::create_gemini_agent_builder(&self.config)?
+                    .preamble(&preamble)
+                    .tools(rig_tools)
+                    .build();
+                self.rig_agent = Some(RigAgentEnum::Gemini(rig_agent));
+            }
+            "mlx" => {
+                let rig_agent = llm::create_mlx_agent_builder(&self.config).await?
+                    .preamble(&preamble)
+                    .tools(rig_tools)
+                    .build();
+                self.rig_agent = Some(RigAgentEnum::MLX(rig_agent));
+            }
+            _ => return Err(anyhow::anyhow!("Unknown provider: {}", self.config.provider)),
+        }
+        
+        Ok(())
+    }
+
     /// Create agent and resume from a previous session
     pub async fn resume(config: Config, workdir: PathBuf, session_id: &str) -> Result<Self> {
         let context = Context::new(&workdir).await?;
@@ -101,7 +173,7 @@ impl Agent {
         let session = Session::load(session_id)?;
         let messages = session.messages.clone();
         
-        Ok(Self {
+        let mut agent = Self {
             config,
             workdir,
             context,
@@ -109,7 +181,12 @@ impl Agent {
             doc_prefetcher: DocPrefetcher::new(),
             repo_map,
             session: Some(session),
-        })
+            rig_agent: None,
+        };
+        
+        agent.init_rig_agent().await?;
+        
+        Ok(agent)
     }
     
     /// Resume the latest session for this workdir
@@ -142,147 +219,50 @@ impl Agent {
         // Start background doc prefetch for this query
         self.doc_prefetcher.prefetch_async(prompt.to_string());
 
+        let rig_agent = self.rig_agent.as_ref().ok_or_else(|| anyhow::anyhow!("Rig agent not initialized"))?;
+        
+        // Convert existing messages to Rig format
+        let mut rig_history: Vec<RigMessage> = Vec::new();
+        for msg in &self.messages {
+            match msg.role {
+                Role::User => rig_history.push(RigMessage::user(&msg.content)),
+                Role::Assistant => rig_history.push(RigMessage::assistant(&msg.content)),
+                _ => {} // Rig handles tool messages internally during chat
+            }
+        }
+
+        // Use Rig's chat interface
+        let response = match rig_agent {
+            RigAgentEnum::OpenAI(agent) => agent.chat(prompt, rig_history).await?,
+            RigAgentEnum::Anthropic(agent) => agent.chat(prompt, rig_history).await?,
+            RigAgentEnum::Gemini(agent) => agent.chat(prompt, rig_history).await?,
+            RigAgentEnum::MLX(agent) => agent.chat(prompt, rig_history).await?,
+        };
+        
+        println!("{}", response);
+        
         self.messages.push(Message {
             role: Role::User,
             content: prompt.to_string(),
             tool_calls: None,
             tool_results: None,
         });
-
-        const MAX_ITERATIONS: usize = 50;
-        let mut iterations = 0;
-        let mut empty_responses = 0;
         
-        loop {
-            iterations += 1;
-            if iterations > MAX_ITERATIONS {
-                println!("\n\x1b[33m⚠️ Maximum iterations reached, stopping.\x1b[0m");
-                self.save_session().ok();
-                break;
-            }
-            
-            let response = self.get_completion_streaming().await?;
-            
-            match response {
-                AgentResponse::Text(text) => {
-                    if !text.is_empty() {
-                        println!("{}", text);
-                        self.messages.push(Message {
-                            role: Role::Assistant,
-                            content: text,
-                            tool_calls: None,
-                            tool_results: None,
-                        });
-                        self.save_session().ok();
-                        break;
-                    } else {
-                        empty_responses += 1;
-                        if empty_responses > 3 {
-                            tracing::warn!("Multiple empty responses, stopping");
-                            break;
-                        }
-                    }
-                }
-                AgentResponse::ToolCalls { text, calls } => {
-                    empty_responses = 0;
-                    
-                    if !text.is_empty() {
-                        println!("{}", text);
-                    }
-                    
-                    let mut results = Vec::new();
-                    let mut executed_calls = Vec::new();
-                    
-                    for call in &calls {
-                        // Check auto-approval
-                        let approved = self.config.should_auto_approve(&call.name);
-                        
-                        if !approved {
-                            print!("\n\x1b[33m🔧 {} - approve? [y/N]: \x1b[0m", call.name);
-                            stdout().flush().ok();
-                            
-                            let mut input = String::new();
-                            std::io::stdin().read_line(&mut input).ok();
-                            
-                            if !input.trim().eq_ignore_ascii_case("y") {
-                                println!("Skipped");
-                                results.push((call.name.clone(), ToolResult::err("Tool skipped by user")));
-                                executed_calls.push(call.clone());
-                                continue;
-                            }
-                        } else {
-                            println!("\n\x1b[36m🔧 {}\x1b[0m", call.name);
-                        }
-                        
-                        let result = tools::execute(&call, &self.workdir, self.config.plan_mode).await;
-                        
-                        if result.success {
-                            println!("\x1b[32m✓\x1b[0m {}", truncate(&result.output, 200));
-                        } else {
-                            println!("\x1b[31m✗\x1b[0m {}", result.output);
-                        }
-                        
-                        results.push((call.name.clone(), result));
-                        executed_calls.push(call.clone());
-                    }
-                    
-                    if !executed_calls.is_empty() {
-                        self.messages.push(Message {
-                            role: Role::Assistant,
-                            content: text,
-                            tool_calls: Some(executed_calls),
-                            tool_results: None,
-                        });
-                        
-                        self.messages.push(Message {
-                            role: Role::Tool,
-                            content: String::new(),
-                            tool_calls: None,
-                            tool_results: Some(results),
-                        });
-                    }
-                }
-                AgentResponse::Completion(result) => {
-                    println!("\n\x1b[32m✅ {result}\x1b[0m");
-                    // Save session on completion
-                    self.save_session().ok();
-                    break;
-                }
-                AgentResponse::Question(q) => {
-                    print!("\n\x1b[33m❓ {q}\x1b[0m\n> ");
-                    stdout().flush().ok();
-                    
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).ok();
-                    
-                    self.messages.push(Message {
-                        role: Role::User,
-                        content: input.trim().to_string(),
-                        tool_calls: None,
-                        tool_results: None,
-                    });
-                }
-            }
-        }
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: response,
+            tool_calls: None,
+            tool_results: None,
+        });
+        
+        self.save_session().ok();
 
         Ok(())
     }
 
-    /// Get completion from LLM
+    /// Get completion from LLM (Legacy, now handled by Rig)
     async fn get_completion_streaming(&self) -> Result<AgentResponse> {
-        let system_prompt = self.build_system_prompt();
-        let tool_defs = tools::definitions(self.config.plan_mode);
-        
-        // Use non-streaming for stability
-        match self.config.provider.as_str() {
-            "gemini" => gemini::complete(&self.config, &system_prompt, &self.messages, &tool_defs).await,
-            "anthropic" => anthropic::complete(&self.config, &system_prompt, &self.messages, &tool_defs).await,
-            // OpenAI and OpenAI-compatible providers (including Ollama)
-            "openai" | "groq" | "together" | "openrouter" | "ollama" => {
-                openai::complete(&self.config, &system_prompt, &self.messages, &tool_defs).await
-            }
-            _ => Err(anyhow::anyhow!("Unknown provider: {}", self.config.provider)),
-        }
+        Err(anyhow::anyhow!("Legacy completion method called. Use run_prompt instead."))
     }
 
     fn build_system_prompt(&self) -> String {
@@ -368,4 +348,27 @@ pub enum AgentResponse {
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } 
     else { format!("{}...", &s[..max]) }
+}
+
+impl Agent {
+    /// Gracefully shutdown the agent and any managed resources
+    pub async fn shutdown(&mut self) -> Result<()> {
+        // Stop MLX server if it was started by this agent
+        if matches!(self.config.provider.as_str(), "mlx") {
+            if let Err(e) = crate::llm::mlx_manager::stop_mlx_server().await {
+                tracing::warn!("Failed to stop MLX server during shutdown: {}", e);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        // Best effort cleanup - can't use async in Drop
+        if matches!(self.config.provider.as_str(), "mlx") {
+            // Try to stop the server synchronously
+            let _ = futures::executor::block_on(crate::llm::mlx_manager::stop_mlx_server());
+        }
+    }
 }

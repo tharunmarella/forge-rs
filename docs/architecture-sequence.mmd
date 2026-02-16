@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant User
+    participant TUI
+    participant Agent
+    participant Context
+    participant API
+    participant Tools
+
+    User->>TUI: type message / Enter
+    TUI->>Agent: run_prompt(msg)
+    Agent->>Context: repo_map + optional DocPrefetcher docs
+    Agent->>API: messages + tool defs → stream
+    API-->>Agent: StreamEvent (text / tool_calls)
+    Agent->>TUI: stream text
+    Agent->>Tools: execute(tool_call)
+    Tools-->>Agent: ToolResult
+    Agent->>API: append tool results → next completion
+    API-->>Agent: text or more tool_calls
+    Agent->>Agent: save_session() / checkpoint

@@ -1,7 +1,8 @@
 use crate::api::{Agent, Message, Role};
 use crate::checkpoint::CheckpointManager;
-use crate::tools::{self, ToolCall};
+use crate::tools::ToolCall;
 use anyhow::Result;
+use rig::completion::Chat;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -330,9 +331,7 @@ async fn handle_slash_command(app: &mut App, cmd: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_message(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, prompt: &str) -> Result<()> {
-    use tokio::time::{timeout, Duration};
-    use crate::api::streaming::StreamEvent;
+async fn send_message(_terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, prompt: &str) -> Result<()> {
     
     app.agent.prefetch_docs(prompt);
     app.messages.push(ChatMessage { role: ChatRole::User, content: prompt.to_string(), tools: vec![] });
@@ -343,192 +342,39 @@ async fn send_message(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
     app.is_thinking = true;
     app.messages.push(ChatMessage { role: ChatRole::Assistant, content: String::new(), tools: vec![] });
     
-    if let Ok(mut rx) = get_completion_streaming(&app.agent).await {
-        let mut accumulated_text = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        
-        loop {
-            match timeout(Duration::from_millis(50), rx.recv()).await {
-                Ok(Some(event)) => {
-                    match event {
-                        StreamEvent::Text(text) | StreamEvent::Thinking(text) => {
-                            accumulated_text.push_str(&text);
-                            if let Some(msg) = app.messages.last_mut() { msg.content = accumulated_text.clone(); }
-                            terminal.draw(|f| draw_ui(f, app))?;
-                        }
-                        StreamEvent::ToolCall { name, arguments, thought_signature } => {
-                            tool_calls.push(ToolCall { name, arguments, thought_signature });
-                        }
-                        StreamEvent::Done => break,
-                        StreamEvent::Error(e) => {
-                            if let Some(msg) = app.messages.last_mut() { msg.content = format!("⚡ Error: {}", e); }
-                            terminal.draw(|f| draw_ui(f, app))?;
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    app.thinking_count = app.thinking_count.wrapping_add(1);
-                    terminal.draw(|f| draw_ui(f, app))?;
-                }
-            }
-        }
-        
-        app.is_thinking = false;
-        app.agent.messages.push(Message { role: Role::Assistant, content: accumulated_text, tool_calls: None, tool_results: None });
-        
-        if !tool_calls.is_empty() {
-            if let Some(msg) = app.messages.last_mut() {
-                msg.tools = tool_calls.iter().map(|c| ToolStatus { name: c.name.clone(), status: ToolState::Pending, duration_ms: None }).collect();
-            }
-            app.pending_tools = tool_calls;
-            app.tool_results.clear();
-            app.current_tool_idx = 0;
-            process_remaining_tools(terminal, app).await?;
+    // Convert existing messages to Rig format
+    let mut rig_history: Vec<rig::completion::Message> = Vec::new();
+    for msg in &app.agent.messages {
+        match msg.role {
+            Role::User => rig_history.push(rig::completion::Message::user(&msg.content)),
+            Role::Assistant => rig_history.push(rig::completion::Message::assistant(&msg.content)),
+            _ => {}
         }
     }
+
+    // Use Rig's chat interface
+    let response: String = match &app.agent.rig_agent {
+        Some(crate::api::RigAgentEnum::OpenAI(agent)) => agent.chat(prompt, rig_history).await?,
+        Some(crate::api::RigAgentEnum::Anthropic(agent)) => agent.chat(prompt, rig_history).await?,
+        Some(crate::api::RigAgentEnum::Gemini(agent)) => agent.chat(prompt, rig_history).await?,
+        Some(crate::api::RigAgentEnum::MLX(agent)) => agent.chat(prompt, rig_history).await?,
+        None => return Err(anyhow::anyhow!("Rig agent not initialized")),
+    };
+    
+    app.is_thinking = false;
+    if let Some(msg) = app.messages.last_mut() { msg.content = response.clone(); }
+    app.agent.messages.push(Message { role: Role::Assistant, content: response, tool_calls: None, tool_results: None });
+    
     app.agent.save_session().ok();
     Ok(())
 }
 
-async fn process_remaining_tools(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    while app.current_tool_idx < app.pending_tools.len() {
-        let call = app.pending_tools[app.current_tool_idx].clone();
-        let idx = app.current_tool_idx;
-        if !(app.session_yolo || app.agent.config.should_auto_approve(&call.name)) {
-            preview_tool_diff(&call, app.agent.workdir());
-            app.pending_approval = Some(PendingApproval { tool: call, idx });
-            return Ok(());
-        }
-        execute_pending_tool(terminal, app, call, idx).await?;
-    }
-    
-    if !app.pending_tools.is_empty() {
-        let calls = std::mem::take(&mut app.pending_tools);
-        let results = std::mem::take(&mut app.tool_results);
-        if let Some(msg) = app.agent.messages.last_mut() { if msg.role == Role::Assistant { msg.tool_calls = Some(calls); } }
-        app.agent.messages.push(Message { role: Role::Tool, content: String::new(), tool_calls: None, tool_results: Some(results) });
-        
-        if let Ok(mut rx) = get_completion_streaming(&app.agent).await {
-            app.is_thinking = true;
-            app.messages.push(ChatMessage { role: ChatRole::Assistant, content: String::new(), tools: vec![] });
-            let mut accumulated_text = String::new();
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
-                    Ok(Some(event)) => {
-                        use crate::api::streaming::StreamEvent;
-                        match event {
-                            StreamEvent::Text(text) | StreamEvent::Thinking(text) => {
-                                accumulated_text.push_str(&text);
-                                if let Some(msg) = app.messages.last_mut() { msg.content = accumulated_text.clone(); }
-                                terminal.draw(|f| draw_ui(f, app))?;
-                            }
-                            StreamEvent::ToolCall { name, arguments, thought_signature } => { tool_calls.push(ToolCall { name, arguments, thought_signature }); }
-                            StreamEvent::Done => break,
-                            StreamEvent::Error(e) => {
-                                if let Some(msg) = app.messages.last_mut() { msg.content = format!("⚡ Error: {}", e); }
-                                terminal.draw(|f| draw_ui(f, app))?;
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => { app.thinking_count = app.thinking_count.wrapping_add(1); terminal.draw(|f| draw_ui(f, app))?; }
-                }
-            }
-            app.is_thinking = false;
-            app.agent.messages.push(Message { role: Role::Assistant, content: accumulated_text, tool_calls: None, tool_results: None });
-            if !tool_calls.is_empty() {
-                if let Some(msg) = app.messages.last_mut() {
-                    msg.tools = tool_calls.iter().map(|c| ToolStatus { name: c.name.clone(), status: ToolState::Pending, duration_ms: None }).collect();
-                }
-                app.pending_tools = tool_calls;
-                app.tool_results.clear();
-                app.current_tool_idx = 0;
-                Box::pin(process_remaining_tools(terminal, app)).await?;
-            }
-        }
-    }
+async fn process_remaining_tools(_terminal: &mut Terminal<CrosstermBackend<Stdout>>, _app: &mut App) -> Result<()> {
     Ok(())
 }
 
-async fn execute_pending_tool(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, tool: ToolCall, idx: usize) -> Result<()> {
-    if let Some(msg) = app.messages.last_mut() { if idx < msg.tools.len() { msg.tools[idx].status = ToolState::Running; } }
-    terminal.draw(|f| draw_ui(f, app))?;
-    let start = std::time::Instant::now();
-    let result = tools::execute(&tool, app.agent.workdir(), app.agent.config.plan_mode).await;
-    let duration = start.elapsed().as_millis() as u64;
-    if let Some(msg) = app.messages.last_mut() {
-        if idx < msg.tools.len() {
-            msg.tools[idx].status = if result.success { ToolState::Success } else { ToolState::Failed };
-            msg.tools[idx].duration_ms = Some(duration);
-        }
-    }
-    app.tool_results.push((tool.name, result));
-    app.current_tool_idx += 1;
+async fn execute_pending_tool(_terminal: &mut Terminal<CrosstermBackend<Stdout>>, _app: &mut App, _tool: ToolCall, _idx: usize) -> Result<()> {
     Ok(())
-}
-
-fn preview_tool_diff(tool: &ToolCall, workdir: &std::path::Path) {
-    use crate::tools::ide;
-    let args = &tool.arguments;
-    match tool.name.as_str() {
-        "write_to_file" => {
-            if let (Some(path), Some(content)) = (args.get("path").and_then(|v| v.as_str()), args.get("content").and_then(|v| v.as_str())) {
-                let full_path = workdir.join(path);
-                let old_content = std::fs::read_to_string(&full_path).unwrap_or_default();
-                ide::show_diff_in_ide(&full_path, &old_content, content);
-            }
-        }
-        "replace_in_file" => {
-            if let (Some(path), Some(old_str), Some(new_str)) = (args.get("path").and_then(|v| v.as_str()), args.get("old_str").and_then(|v| v.as_str()), args.get("new_str").and_then(|v| v.as_str())) {
-                let full_path = workdir.join(path);
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    let new_content = content.replacen(old_str, new_str, 1);
-                    ide::show_diff_in_ide(&full_path, &content, &new_content);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-async fn get_completion_streaming(agent: &Agent) -> Result<crate::api::streaming::StreamReceiver> {
-    use crate::api::gemini;
-    let prefetched_docs = agent.doc_prefetcher().get_cached_docs_for_prompt();
-    let system_prompt = format!("You are Forge, a terminal-first AI coding agent.\nWorking directory: {}\n\nRules:\n- Be concise and direct\n- Use tools to complete tasks\n- Read files before editing\n{}", agent.workdir().display(), prefetched_docs);
-    let tool_defs = tools::definitions(agent.config.plan_mode);
-
-    match agent.config.provider.as_str() {
-        "gemini" => gemini::complete_streaming(&agent.config, &system_prompt, agent.messages(), &tool_defs).await,
-        _ => {
-            use crate::api::{anthropic, openai, streaming::{StreamEvent, create_stream}};
-            let (tx, rx) = create_stream();
-            let config = agent.config.clone();
-            let messages = agent.messages().to_vec();
-            let provider = agent.config.provider.clone();
-            tokio::spawn(async move {
-                let result = match provider.as_str() {
-                    "anthropic" => anthropic::complete(&config, &system_prompt, &messages, &tool_defs).await,
-                    "openai" | "groq" | "together" | "openrouter" => openai::complete(&config, &system_prompt, &messages, &tool_defs).await,
-                    _ => Err(anyhow::anyhow!("Unknown provider")),
-                };
-                match result {
-                    Ok(crate::api::AgentResponse::Text(text)) => { tx.send(StreamEvent::Text(text)).await.ok(); }
-                    Ok(crate::api::AgentResponse::ToolCalls { text, calls }) => {
-                        if !text.is_empty() { tx.send(StreamEvent::Text(text)).await.ok(); }
-                        for call in calls { tx.send(StreamEvent::ToolCall { name: call.name, arguments: call.arguments, thought_signature: call.thought_signature }).await.ok(); }
-                    }
-                    Err(e) => { tx.send(StreamEvent::Error(e.to_string())).await.ok(); }
-                    _ => {}
-                }
-                tx.send(StreamEvent::Done).await.ok();
-            });
-            Ok(rx)
-        }
-    }
 }
 
 fn draw_ui(f: &mut Frame, app: &mut App) {

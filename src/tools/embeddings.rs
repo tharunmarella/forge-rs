@@ -1,57 +1,126 @@
 use anyhow::Result;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::path::Path;
+use rig::client::EmbeddingsClient;
+use rig::embeddings::EmbeddingsBuilder;
+use rig::providers::{openai, gemini};
+use serde_json;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid;
 use walkdir::WalkDir;
 
-/// Embedding provider type
-#[derive(Clone, Debug)]
+/// Embedding provider type using rig-core models and MLX
+#[derive(Clone)]
 pub enum EmbeddingProvider {
-    /// Gemini embeddings
-    Gemini { api_key: String },
     /// OpenAI embeddings (works with OpenAI-compatible APIs)
-    OpenAI { api_key: String, base_url: String },
-    /// Ollama local embeddings (free, works offline)
-    Ollama { base_url: String },
+    OpenAI(openai::EmbeddingModel),
+    /// Gemini embeddings  
+    Gemini(gemini::EmbeddingModel),
+    /// Anthropic (uses OpenAI-compatible endpoint)
+    Anthropic(openai::EmbeddingModel),
+    /// MLX local embeddings (Apple Silicon optimized)
+    MLX { model_name: String },
     /// Disabled (no embeddings - semantic search unavailable)
     None,
 }
 
+impl std::fmt::Debug for EmbeddingProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbeddingProvider::OpenAI(_) => write!(f, "OpenAI"),
+            EmbeddingProvider::Gemini(_) => write!(f, "Gemini"),
+            EmbeddingProvider::Anthropic(_) => write!(f, "Anthropic"),
+            EmbeddingProvider::MLX { model_name } => write!(f, "MLX({})", model_name),
+            EmbeddingProvider::None => write!(f, "None"),
+        }
+    }
+}
+
 impl EmbeddingProvider {
     /// Create provider based on LLM provider config
-    pub fn from_config(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -> Self {
+    pub fn from_config(provider: &str, api_key: Option<&str>, _base_url: Option<&str>) -> Self {
+        let api_key = api_key.unwrap_or_default();
+        
         match provider {
-            "gemini" => EmbeddingProvider::Gemini {
-                api_key: api_key.unwrap_or_default().to_string(),
+            "gemini" => {
+                if api_key.is_empty() {
+                    tracing::warn!("Gemini API key not provided, embeddings disabled");
+                    return EmbeddingProvider::None;
+                }
+                match gemini::Client::new(api_key) {
+                    Ok(client) => {
+                        let model = client.embedding_model("text-embedding-004");
+                        EmbeddingProvider::Gemini(model)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create Gemini client: {}", e);
+                        EmbeddingProvider::None
+                    }
+                }
             },
-            "openai" => EmbeddingProvider::OpenAI {
-                api_key: api_key.unwrap_or_default().to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
+            "openai" => {
+                if api_key.is_empty() {
+                    tracing::warn!("OpenAI API key not provided, embeddings disabled");
+                    return EmbeddingProvider::None;
+                }
+                match openai::Client::new(api_key) {
+                    Ok(client) => {
+                        let model = client.embedding_model("text-embedding-3-small");
+                        EmbeddingProvider::OpenAI(model)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create OpenAI client: {}", e);
+                        EmbeddingProvider::None
+                    }
+                }
             },
-            "groq" => EmbeddingProvider::OpenAI {
-                api_key: api_key.unwrap_or_default().to_string(),
-                base_url: "https://api.groq.com/openai/v1".to_string(),
+            "groq" | "together" | "openrouter" => {
+                if api_key.is_empty() {
+                    tracing::warn!("{} API key not provided, embeddings disabled", provider);
+                    return EmbeddingProvider::None;
+                }
+                // Note: rig-core doesn't support custom base URLs for OpenAI-compatible providers yet
+                // For now, we disable embeddings for these providers
+                tracing::warn!("Provider {} doesn't support embeddings via rig-core yet, disabled", provider);
+                EmbeddingProvider::None
             },
-            "together" => EmbeddingProvider::OpenAI {
-                api_key: api_key.unwrap_or_default().to_string(),
-                base_url: "https://api.together.xyz/v1".to_string(),
+            "anthropic" => {
+                if api_key.is_empty() {
+                    tracing::warn!("Anthropic API key not provided, embeddings disabled");
+                    return EmbeddingProvider::None;
+                }
+                // Anthropic doesn't have native embeddings, use OpenAI-compatible fallback
+                match openai::Client::new(api_key) {
+                    Ok(client) => {
+                        let model = client.embedding_model("text-embedding-3-small");
+                        EmbeddingProvider::Anthropic(model)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create Anthropic fallback client: {}", e);
+                        EmbeddingProvider::None
+                    }
+                }
             },
-            "openrouter" => EmbeddingProvider::OpenAI {
-                api_key: api_key.unwrap_or_default().to_string(),
-                base_url: base_url.unwrap_or("https://openrouter.ai/api/v1").to_string(),
+            "mlx" => {
+                // MLX local embeddings for Apple Silicon
+                let model_name = _base_url.unwrap_or("mlx-community/all-MiniLM-L6-v2-4bit").to_string();
+                EmbeddingProvider::MLX { model_name }
             },
-            "ollama" => EmbeddingProvider::Ollama {
-                base_url: base_url.unwrap_or("http://localhost:11434").to_string(),
-            },
-            // Anthropic and others: try Ollama first, fall back to None
-            "anthropic" => EmbeddingProvider::Ollama {
-                base_url: "http://localhost:11434".to_string(),
-            },
-            // Default: try local Ollama (run `ollama pull nomic-embed-text` for semantic search)
-            _ => EmbeddingProvider::Ollama {
-                base_url: "http://localhost:11434".to_string(),
+            // Default: try MLX first (for Apple Silicon), then disable
+            _ => {
+                #[cfg(target_os = "macos")]
+                {
+                    tracing::info!("Provider {} doesn't support embeddings, trying MLX fallback", provider);
+                    EmbeddingProvider::MLX { 
+                        model_name: "mlx-community/all-MiniLM-L6-v2-4bit".to_string() 
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    tracing::info!("Provider {} doesn't support embeddings, disabled", provider);
+                    EmbeddingProvider::None
+                }
             },
         }
     }
@@ -70,7 +139,6 @@ pub struct CodeChunk {
 /// Embedding store for semantic search
 pub struct EmbeddingStore {
     provider: EmbeddingProvider,
-    client: Client,
     chunks: Arc<RwLock<Vec<CodeChunk>>>,
 }
 
@@ -79,7 +147,6 @@ impl EmbeddingStore {
     pub fn new(provider: EmbeddingProvider) -> Result<Self> {
         Ok(Self {
             provider,
-            client: Client::new(),
             chunks: Arc::new(RwLock::new(Vec::new())),
         })
     }
@@ -89,19 +156,21 @@ impl EmbeddingStore {
         self.embed_texts(texts).await
     }
     
-    /// Generate embeddings for texts
+    /// Generate embeddings for texts using rig-core
     async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
         match &self.provider {
-            EmbeddingProvider::Gemini { api_key } => self.embed_gemini(texts, api_key).await,
-            EmbeddingProvider::OpenAI { api_key, base_url } => {
-                self.embed_openai(texts, api_key, base_url).await
+            EmbeddingProvider::OpenAI(model) | EmbeddingProvider::Anthropic(model) => {
+                self.embed_with_rig_model(texts, model).await
             }
-            EmbeddingProvider::Ollama { base_url } => {
-                self.embed_ollama(texts, base_url).await
+            EmbeddingProvider::Gemini(model) => {
+                self.embed_with_rig_gemini(texts, model).await
+            }
+            EmbeddingProvider::MLX { model_name } => {
+                self.embed_with_mlx(texts, model_name).await
             }
             EmbeddingProvider::None => {
                 // Return zero vectors (embeddings disabled)
@@ -110,155 +179,158 @@ impl EmbeddingStore {
         }
     }
 
-    /// Gemini embeddings
-    async fn embed_gemini(&self, texts: &[&str], api_key: &str) -> Result<Vec<Vec<f32>>> {
-        #[derive(Serialize)]
-        struct GeminiRequest<'a> {
-            requests: Vec<GeminiEmbedRequest<'a>>,
-        }
-
-        #[derive(Serialize)]
-        struct GeminiEmbedRequest<'a> {
-            model: &'static str,
-            content: GeminiContent<'a>,
-        }
-
-        #[derive(Serialize)]
-        struct GeminiContent<'a> {
-            parts: Vec<GeminiPart<'a>>,
-        }
-
-        #[derive(Serialize)]
-        struct GeminiPart<'a> {
-            text: &'a str,
-        }
-
-        #[derive(Deserialize)]
-        struct GeminiResponse {
-            embeddings: Vec<GeminiEmbedding>,
-        }
-
-        #[derive(Deserialize)]
-        struct GeminiEmbedding {
-            values: Vec<f32>,
-        }
-
-        // Gemini batch embed endpoint
-        let requests: Vec<_> = texts
-            .iter()
-            .map(|text| GeminiEmbedRequest {
-                model: "models/text-embedding-004",
-                content: GeminiContent {
-                    parts: vec![GeminiPart { text }],
-                },
-            })
-            .collect();
-
-        let resp = self
-            .client
-            .post(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={}",
-                api_key
-            ))
-            .header("Content-Type", "application/json")
-            .json(&GeminiRequest { requests })
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = resp.text().await?;
-            return Err(anyhow::anyhow!("Gemini embeddings error: {}", err));
-        }
-
-        let response: GeminiResponse = resp.json().await?;
-        Ok(response.embeddings.into_iter().map(|e| e.values).collect())
-    }
-
-    /// OpenAI-compatible embeddings
-    async fn embed_openai(&self, texts: &[&str], api_key: &str, base_url: &str) -> Result<Vec<Vec<f32>>> {
-        #[derive(Serialize)]
-        struct OpenAIRequest<'a> {
-            input: &'a [&'a str],
-            model: &'static str,
-        }
-
-        #[derive(Deserialize)]
-        struct OpenAIResponse {
-            data: Vec<OpenAIEmbedding>,
-        }
-
-        #[derive(Deserialize)]
-        struct OpenAIEmbedding {
-            embedding: Vec<f32>,
-        }
-
-        let resp = self
-            .client
-            .post(format!("{}/embeddings", base_url))
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&OpenAIRequest {
-                input: texts,
-                model: "text-embedding-3-small",
-            })
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = resp.text().await?;
-            return Err(anyhow::anyhow!("OpenAI embeddings error: {}", err));
-        }
-
-        let response: OpenAIResponse = resp.json().await?;
-        Ok(response.data.into_iter().map(|e| e.embedding).collect())
-    }
-
-    /// Ollama local embeddings
-    async fn embed_ollama(&self, texts: &[&str], base_url: &str) -> Result<Vec<Vec<f32>>> {
-        #[derive(Serialize)]
-        struct OllamaRequest<'a> {
-            model: &'static str,
-            prompt: &'a str,
-        }
-
-        #[derive(Deserialize)]
-        struct OllamaResponse {
-            embedding: Vec<f32>,
-        }
-
-        let mut embeddings = Vec::new();
+    /// Generate embeddings using rig-core OpenAI model
+    async fn embed_with_rig_model(&self, texts: &[&str], model: &openai::EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+        let mut builder = EmbeddingsBuilder::new(model.clone());
         
-        // Ollama doesn't support batch embeddings, so we process one at a time
         for text in texts {
-            let resp = self
-                .client
-                .post(format!("{}/api/embeddings", base_url))
-                .header("Content-Type", "application/json")
-                .json(&OllamaRequest {
-                    model: "nomic-embed-text",  // Common embedding model for Ollama
-                    prompt: text,
-                })
-                .send()
-                .await;
-            
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    if let Ok(response) = r.json::<OllamaResponse>().await {
-                        embeddings.push(response.embedding);
-                    } else {
-                        // Fallback: return zero vector if parsing fails
-                        embeddings.push(vec![0.0; 768]);
-                    }
-                }
-                _ => {
-                    // Embedding model not available, use zero vector
-                    embeddings.push(vec![0.0; 768]);
-                }
+            builder = builder.document(*text)?;
+        }
+        
+        let embeddings = builder.build().await?;
+        
+        let mut results = Vec::new();
+        for (_, embedding) in embeddings {
+            // OneOrMany is a struct, not an enum - iterate over all embeddings
+            for emb in embedding {
+                // Convert f64 to f32
+                let f32_vec: Vec<f32> = emb.vec.into_iter().map(|x| x as f32).collect();
+                results.push(f32_vec);
             }
         }
-
-        Ok(embeddings)
+        
+        Ok(results)
     }
+
+    /// Generate embeddings using rig-core Gemini model  
+    async fn embed_with_rig_gemini(&self, texts: &[&str], model: &gemini::EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+        let mut builder = EmbeddingsBuilder::new(model.clone());
+        
+        for text in texts {
+            builder = builder.document(*text)?;
+        }
+        
+        let embeddings = builder.build().await?;
+        
+        let mut results = Vec::new();
+        for (_, embedding) in embeddings {
+            // OneOrMany is a struct, not an enum - iterate over all embeddings
+            for emb in embedding {
+                // Convert f64 to f32
+                let f32_vec: Vec<f32> = emb.vec.into_iter().map(|x| x as f32).collect();
+                results.push(f32_vec);
+            }
+        }
+        
+        Ok(results)
+    }
+
+    /// Generate embeddings using MLX (Apple Silicon optimized)
+    async fn embed_with_mlx(
+        &self,
+        texts: &[&str],
+        model_name: &str,
+    ) -> Result<Vec<Vec<f32>>> {
+        // Find the MLX embeddings script
+        let script_path = self.find_mlx_script()?;
+        
+        // Prepare input data
+        let input_data = serde_json::json!({
+            "texts": texts
+        });
+        
+        // Create temporary files for communication
+        let temp_dir = std::env::temp_dir();
+        let input_file = temp_dir.join(format!("mlx_input_{}.json", uuid::Uuid::new_v4()));
+        let output_file = temp_dir.join(format!("mlx_output_{}.json", uuid::Uuid::new_v4()));
+        
+        // Write input data
+        tokio::fs::write(&input_file, serde_json::to_string(&input_data)?).await?;
+        
+        // Execute MLX embeddings script
+        let output = Command::new("python3")
+            .arg(&script_path)
+            .arg("--model")
+            .arg(model_name)
+            .arg("--input")
+            .arg(&input_file)
+            .arg("--output")
+            .arg(&output_file)
+            .output()?;
+        
+        // Clean up input file
+        let _ = tokio::fs::remove_file(&input_file).await;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("MLX embeddings failed: {}", stderr));
+        }
+        
+        // Read output data
+        let output_data = tokio::fs::read_to_string(&output_file).await?;
+        let _ = tokio::fs::remove_file(&output_file).await;
+        
+        let result: serde_json::Value = serde_json::from_str(&output_data)?;
+        
+        // Check for errors
+        if let Some(error) = result.get("error") {
+            return Err(anyhow::anyhow!("MLX embeddings error: {}", error));
+        }
+        
+        // Extract embeddings
+        let embeddings = result.get("embeddings")
+            .ok_or_else(|| anyhow::anyhow!("No embeddings in MLX response"))?
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Embeddings is not an array"))?;
+        
+        let mut result_embeddings = Vec::new();
+        for embedding in embeddings {
+            let embedding_array = embedding.as_array()
+                .ok_or_else(|| anyhow::anyhow!("Embedding is not an array"))?;
+            
+            let embedding_vec: Result<Vec<f32>, _> = embedding_array
+                .iter()
+                .map(|v| v.as_f64().ok_or_else(|| anyhow::anyhow!("Invalid embedding value")).map(|f| f as f32))
+                .collect();
+            
+            result_embeddings.push(embedding_vec?);
+        }
+        
+        Ok(result_embeddings)
+    }
+    
+    /// Find the MLX embeddings script path
+    fn find_mlx_script(&self) -> Result<PathBuf> {
+        // Try relative to current executable
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("No parent directory"))?;
+        
+        // Check ../scripts/mlx_embeddings.py (development)
+        let dev_script = exe_dir.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("scripts").join("mlx_embeddings.py"));
+        
+        if let Some(script) = dev_script {
+            if script.exists() {
+                return Ok(script);
+            }
+        }
+        
+        // Check ./scripts/mlx_embeddings.py (relative to exe)
+        let rel_script = exe_dir.join("scripts").join("mlx_embeddings.py");
+        if rel_script.exists() {
+            return Ok(rel_script);
+        }
+        
+        // Check current working directory
+        let cwd_script = std::env::current_dir()?.join("scripts").join("mlx_embeddings.py");
+        if cwd_script.exists() {
+            return Ok(cwd_script);
+        }
+        
+        Err(anyhow::anyhow!("MLX embeddings script not found. Expected at scripts/mlx_embeddings.py"))
+    }
+
 
     /// Index a workspace directory
     pub async fn index_workspace(&self, workdir: &Path) -> Result<usize> {

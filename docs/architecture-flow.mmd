@@ -1,0 +1,77 @@
+flowchart TB
+    subgraph Entry["Entry & CLI"]
+        main["main.rs"]
+        CLI["clap (CLI)"]
+        main --> CLI
+    end
+
+    subgraph ConfigLayer["Config & Setup"]
+        Config["config::Config"]
+        Setup["setup (wizard)"]
+        Config --> Setup
+    end
+
+    subgraph Persistence["Persistence"]
+        Session["session::Session"]
+        Checkpoint["checkpoint::CheckpointManager"]
+    end
+
+    subgraph UI["User Interface"]
+        TUI["tui::run()"]
+        SingleShot["agent.run_prompt()"]
+    end
+
+    subgraph AgentCore["Agent (api::Agent)"]
+        Agent["Agent"]
+        Agent --> Config
+        Agent --> Context
+        Agent --> RepoMap
+        Agent --> DocPrefetcher
+        Agent --> Session
+    end
+
+    subgraph ContextLayer["Context Assembly"]
+        Context["context::Context<br/>file list, stats"]
+        RepoMap["repomap::RepoMap<br/>tree-sitter, PageRank"]
+        DocPrefetcher["context7::DocPrefetcher<br/>Context7 API docs"]
+    end
+
+    subgraph APILayer["API (LLM Providers)"]
+        streaming["streaming"]
+        gemini["api::gemini"]
+        anthropic["api::anthropic"]
+        openai["api::openai"]
+        streaming --> gemini
+        streaming --> anthropic
+        streaming --> openai
+    end
+
+    subgraph Tools["tools"]
+        execute["execute_command"]
+        files["files: read write replace patch list delete"]
+        search["search: grep glob codebase_search"]
+        code["code: LSP + tree-sitter defs refs"]
+        web["web: search fetch fetch_documentation"]
+        embeddings["embeddings + embeddings_store"]
+        lint["lint / diagnostics"]
+        ide["ide apply_patch via EditAgent"]
+    end
+
+    subgraph EditAgent["edit_agent"]
+        EditAgentCore["EditAgent<br/>whole-file search-replace unified-diff"]
+    end
+
+    main --> ConfigLayer
+    main --> Checkpoint
+    main --> Agent
+    main --> TUI
+    main --> SingleShot
+
+    TUI --> Agent
+    SingleShot --> Agent
+
+    Agent --> APILayer
+    Agent --> Tools
+    ide --> EditAgentCore
+
+    Agent --> Persistence

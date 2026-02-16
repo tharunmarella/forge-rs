@@ -1,10 +1,10 @@
+pub mod types;
 mod client;
 mod languages;
-mod types;
 
 pub use client::LspClient;
-pub use languages::{LanguageServerConfig, detect_installed_servers, get_server_for_file};
-pub use types::{Location, Diagnostic, DiagnosticSeverity};
+pub use languages::{LanguageServerConfig, detect_installed_servers};
+pub use types::Location;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,12 @@ impl LspManager {
         }
         
         Some(client)
+    }
+
+    /// Get document symbols
+    pub async fn get_document_symbols(&self, file_path: &Path) -> Option<serde_json::Value> {
+        let client = self.get_client_for_file(file_path).await?;
+        client.document_symbols(file_path).await.ok()
     }
     
     /// Go to definition for a symbol at a position

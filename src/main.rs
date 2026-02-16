@@ -1,9 +1,10 @@
 mod api;
 mod checkpoint;
+mod code_graph;
 mod config;
 mod context;
 mod context7;
-mod edit_agent;
+mod llm;
 mod lsp;
 mod repomap;
 mod session;
@@ -88,6 +89,7 @@ enum Commands {
         id: String,
     },
     
+    
     /// Configure forge settings
     Config {
         /// Setting to change (e.g., auto-approve.write_operations=true)
@@ -115,7 +117,7 @@ enum SessionAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let start_time = std::time::Instant::now();
+    let _start_time = std::time::Instant::now();
     let cli = Cli::parse();
 
     // Initialize logging
@@ -152,7 +154,7 @@ async fn main() -> Result<()> {
 
     // Handle subcommands
     if let Some(cmd) = cli.command {
-        return handle_command(cmd, &workdir);
+        return handle_command(cmd, &workdir).await;
     }
 
     // Load or create config
@@ -228,7 +230,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_command(cmd: Commands, workdir: &std::path::Path) -> Result<()> {
+async fn handle_command(cmd: Commands, workdir: &std::path::Path) -> Result<()> {
     match cmd {
         Commands::Setup => {
             let mut cfg = config::Config::load()?;
