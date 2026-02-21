@@ -50,12 +50,11 @@ const PROVIDERS: &[Provider] = &[
         name: "Google Gemini",
         id: "gemini",
         models: &[
-            "gemini-2.5-flash",              // Fast & capable
-            "gemini-2.5-pro",                // Best Gemini for coding
-            "gemini-3-flash",                // 78% SWE-bench
-            "gemini-3-pro",                  // Most intelligent
-            "gemini-2.0-flash",              // Workhorse
-            "gemini-2.0-flash-thinking-exp", // With reasoning
+            "gemini-3-flash-preview",            // Most balanced (Dec 2025)
+            "gemini-3-pro-preview",              // Most intelligent (Nov 2025)
+            "gemini-2.5-flash",                  // Best price-performance (Stable)
+            "gemini-2.5-pro",                    // Advanced thinking (Stable)
+            "gemini-2.0-flash-exp",              // Fast experimental
         ],
         env_var: "GEMINI_API_KEY",
         base_url: None,
@@ -77,9 +76,9 @@ const PROVIDERS: &[Provider] = &[
         env_var: "OPENAI_API_KEY",
         base_url: None,
     },
-    // === Groq - Fastest inference ===
+    // === Groq ===
     Provider {
-        name: "Groq (Fastest)",
+        name: "Groq",
         id: "groq",
         models: &[
             "llama-3.3-70b-versatile",       // Best overall
@@ -93,38 +92,20 @@ const PROVIDERS: &[Provider] = &[
         env_var: "GROQ_API_KEY",
         base_url: Some("https://api.groq.com/openai/v1"),
     },
-    // === Together AI - Open source models ===
+    // === Local Models - Apple Silicon ===
     Provider {
-        name: "Together AI",
-        id: "together",
+        name: "Local Models - Apple Silicon",
+        id: "mlx",
         models: &[
-            "Qwen/Qwen3-Coder-480B-A35B",    // Largest open coder
-            "Qwen/Qwen2.5-Coder-32B-Instruct",// Great coder
-            "deepseek-ai/DeepSeek-R1",       // State-of-art reasoning
-            "deepseek-ai/DeepSeek-V3",       // Latest DeepSeek
-            "deepseek-ai/DeepCoder-14B",     // o3-mini level coding
-            "meta-llama/Llama-4-Scout",      // Latest Llama
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "Qwen/QwQ-32B",                  // Pure RL reasoning
+            "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit (🔥 Context)",
+            "mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit (🧠 Thinking)",
+            "mlx-community/GLM-4.7-Flash-4bit (⚡ Agentic)",
+            "mlx-community/gpt-oss-20b-MXFP4-Q4 (💎 Tools)",
+            "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit (Balanced)",
+            "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit (Fast)",
         ],
-        env_var: "TOGETHER_API_KEY",
-        base_url: Some("https://api.together.xyz/v1"),
-    },
-    // === OpenRouter - Access all models ===
-    Provider {
-        name: "OpenRouter",
-        id: "openrouter",
-        models: &[
-            "anthropic/claude-sonnet-4.5",   // Best Claude
-            "anthropic/claude-opus-4.5",     // Top Claude
-            "openai/gpt-5.2",                // Latest GPT
-            "google/gemini-3-pro",           // Latest Gemini
-            "deepseek/deepseek-r1",          // Best open reasoning
-            "qwen/qwen3-coder-480b",         // Best open coder
-            "meta-llama/llama-4",            // Latest Llama
-        ],
-        env_var: "OPENROUTER_API_KEY",
-        base_url: Some("https://openrouter.ai/api/v1"),
+        env_var: "LOCAL_MODELS", // Not actually used but required by struct
+        base_url: None,
     },
 ];
 
@@ -146,6 +127,9 @@ struct SetupState {
 
 /// Check if setup is needed
 pub fn needs_setup(config: &Config) -> bool {
+    if config.is_local_model() {
+        return false;
+    }
     config.api_key().is_none()
 }
 
@@ -189,7 +173,12 @@ fn run_setup_loop(
                 KeyCode::Enter => {
                     match state.step {
                         SetupStep::Provider => {
-                            state.step = SetupStep::ApiKey;
+                            let provider = &PROVIDERS[state.provider_idx];
+                            if provider.id == "mlx" || provider.id == "local" {
+                                state.step = SetupStep::Model;
+                            } else {
+                                state.step = SetupStep::ApiKey;
+                            }
                             state.error = None;
                         }
                         SetupStep::ApiKey => {
@@ -204,20 +193,64 @@ fn run_setup_loop(
                             // Save config
                             let provider = &PROVIDERS[state.provider_idx];
                             config.provider = provider.id.to_string();
-                            config.model = provider.models[state.model_idx].to_string();
+                            
+                            // Extract model name (strip description if present)
+                            let model_str = provider.models[state.model_idx];
+                            let model_name = model_str.split(" (").next().unwrap_or(model_str);
+                            config.model = model_name.to_string();
                             config.base_url = provider.base_url.map(|s| s.to_string());
+                            
+                            // Set local_server_url for MLX provider
+                            if provider.id == "mlx" {
+                                config.local_server_url = Some("native-mlx".to_string());
+                            }
                             
                             match provider.id {
                                 "gemini" => config.gemini_api_key = Some(state.api_key.clone()),
                                 "anthropic" => config.anthropic_api_key = Some(state.api_key.clone()),
                                 "openai" => config.openai_api_key = Some(state.api_key.clone()),
                                 "groq" => config.groq_api_key = Some(state.api_key.clone()),
-                                "together" => config.together_api_key = Some(state.api_key.clone()),
-                                "openrouter" => config.openrouter_api_key = Some(state.api_key.clone()),
                                 _ => {}
                             }
                             
                             config.save()?;
+                            
+                            // For MLX, download model during setup
+                            if provider.id == "mlx" {
+                                // Exit TUI temporarily to show progress bar
+                                disable_raw_mode()?;
+                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                                
+                                println!("\n📥 Downloading model files...");
+                                println!("This may take several minutes (~2-4GB)\n");
+                                
+                                // Initialize MLX manager (this will download the model with progress bar)
+                                use crate::llm::mlx_native;
+                                let model_name = config.model.clone();
+                                
+                                // Run async code in sync context
+                                let result = tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(async {
+                                        mlx_native::init_mlx_native_manager(model_name).await
+                                    })
+                                });
+                                
+                                match result {
+                                    Ok(_) => {
+                                        println!("\n✓ Model downloaded and ready!");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("\n✗ Failed to download model: {}", e);
+                                        eprintln!("You can try again by running 'forge' - it will retry the download.");
+                                    }
+                                }
+                                
+                                // Re-enter TUI
+                                enable_raw_mode()?;
+                                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                terminal.clear()?;
+                            }
+                            
                             state.step = SetupStep::Done;
                         }
                         SetupStep::Done => return Ok(true),
@@ -377,7 +410,9 @@ fn draw_setup(f: &mut Frame, state: &SetupState) {
                 } else {
                     Style::default().fg(WHITE)
                 };
-                ListItem::new(Line::from(Span::styled(format!("  {}  ", m), style)))
+                // Strip mlx-community/ prefix for display
+                let display_name = m.strip_prefix("mlx-community/").unwrap_or(m);
+                ListItem::new(Line::from(Span::styled(format!("  {}  ", display_name), style)))
             }).collect();
 
             let list = List::new(items)
@@ -386,12 +421,16 @@ fn draw_setup(f: &mut Frame, state: &SetupState) {
         }
         SetupStep::Done => {
             let provider = &PROVIDERS[state.provider_idx];
+            // Extract clean model name without description
+            let model_str = provider.models[state.model_idx];
+            let model_name = model_str.split(" (").next().unwrap_or(model_str);
+            
             let lines = vec![
                 Line::from(""),
                 Line::from(Span::styled("✓ Setup complete!", Style::default().fg(GREEN).add_modifier(Modifier::BOLD))),
                 Line::from(""),
                 Line::from(Span::styled(format!("Provider: {}", provider.name), Style::default().fg(WHITE))),
-                Line::from(Span::styled(format!("Model: {}", provider.models[state.model_idx]), Style::default().fg(WHITE))),
+                Line::from(Span::styled(format!("Model: {}", model_name), Style::default().fg(WHITE))),
                 Line::from(""),
                 Line::from(Span::styled("Press Enter to start", Style::default().fg(DIM))),
             ];

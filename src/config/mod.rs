@@ -7,6 +7,19 @@ use std::path::PathBuf;
 pub struct Config {
     pub provider: String,
     pub model: String,
+    
+    /// Specialized model for planning and strategy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_model: Option<String>,
+    
+    /// Specialized model for deep reasoning (e.g. o1, deepseek-r1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoner_model: Option<String>,
+    
+    /// Specialized model for fast tool-calling (e.g. gpt-4o-mini)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_model: Option<String>,
+
     pub plan_mode: bool,
     
     /// Custom base URL for OpenAI-compatible APIs
@@ -30,10 +43,6 @@ pub struct Config {
     pub openai_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groq_api_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub together_api_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub openrouter_api_key: Option<String>,
     
     
     /// Enable self-correction loop (lint → fix → retry)
@@ -48,14 +57,18 @@ pub struct Config {
     /// Options: "auto", "whole-file", "search-replace", "unified-diff"
     #[serde(default)]
     pub edit_format: String,
-
+    
     /// Disable RepoMap building on startup
     #[serde(default)]
     pub no_repomap: bool,
-
+    
     /// Session timeout in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    
+    /// Local model server URL (for Ollama, LocalAI, MLX, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_server_url: Option<String>,
 }
 
 fn default_max_retries() -> u32 {
@@ -72,10 +85,6 @@ pub struct ModelsConfig {
     pub openai: Vec<String>,
     #[serde(default = "default_groq_models")]
     pub groq: Vec<String>,
-    #[serde(default = "default_together_models")]
-    pub together: Vec<String>,
-    #[serde(default = "default_openrouter_models")]
-    pub openrouter: Vec<String>,
     #[serde(default = "default_mlx_models")]
     pub mlx: Vec<String>,
 }
@@ -83,11 +92,11 @@ pub struct ModelsConfig {
 
 fn default_gemini_models() -> Vec<String> {
     vec![
-        "gemini-2.5-flash".into(),
-        "gemini-2.5-pro".into(),
-        "gemini-2.0-flash".into(),
         "gemini-3-flash-preview".into(),
         "gemini-3-pro-preview".into(),
+        "gemini-2.5-flash".into(),
+        "gemini-2.5-pro".into(),
+        "gemini-2.0-flash-exp".into(),
     ]
 }
 
@@ -116,30 +125,13 @@ fn default_groq_models() -> Vec<String> {
     ]
 }
 
-fn default_together_models() -> Vec<String> {
-    vec![
-        "Qwen/Qwen2.5-Coder-32B-Instruct".into(),
-        "deepseek-ai/DeepSeek-R1".into(),
-        "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
-    ]
-}
-
-fn default_openrouter_models() -> Vec<String> {
-    vec![
-        "anthropic/claude-sonnet-4.5".into(),
-        "openai/gpt-4o".into(),
-        "deepseek/deepseek-r1".into(),
-    ]
-}
-
 fn default_mlx_models() -> Vec<String> {
     vec![
-        "mlx-community/Llama-3.2-3B-Instruct-4bit".into(),
+        "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".into(),
         "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
-        "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit".into(),
-        "mlx-community/CodeLlama-7b-Instruct-hf-4bit".into(),
+        "mlx-community/Llama-3.2-3B-Instruct-4bit".into(),
         "mlx-community/Llama-3.1-8B-Instruct-4bit".into(),
-        "mlx-community/Mistral-7B-Instruct-v0.3-4bit".into(),
+        "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit".into(),
     ]
 }
 
@@ -150,8 +142,6 @@ impl Default for ModelsConfig {
             anthropic: default_anthropic_models(),
             openai: default_openai_models(),
             groq: default_groq_models(),
-            together: default_together_models(),
-            openrouter: default_openrouter_models(),
             mlx: default_mlx_models(),
         }
     }
@@ -171,6 +161,10 @@ pub struct AutoApproveConfig {
     #[serde(default)]
     pub commands: bool,
     
+    /// Auto-approve all tool calls (YOLO mode)
+    #[serde(default)]
+    pub yolo: bool,
+    
     /// Specific tools to always auto-approve
     #[serde(default)]
     pub tools: HashSet<String>,
@@ -188,6 +182,7 @@ impl Default for AutoApproveConfig {
             read_operations: true,  // Auto-approve reads by default
             write_operations: false,
             commands: false,
+            yolo: false,
             tools: HashSet::new(),
             command_patterns: Vec::new(),
         }
@@ -199,6 +194,9 @@ impl Default for Config {
         Self {
             provider: "gemini".to_string(),
             model: "gemini-2.5-flash".to_string(),
+            planner_model: None,
+            reasoner_model: None,
+            tool_model: None,
             plan_mode: false,
             base_url: None,
             models: ModelsConfig::default(),
@@ -207,13 +205,12 @@ impl Default for Config {
             anthropic_api_key: None,
             openai_api_key: None,
             groq_api_key: None,
-            together_api_key: None,
-            openrouter_api_key: None,
             self_correction: true, // Enable by default for local models
             max_retries: 3,
             edit_format: "auto".to_string(), // Auto-detect based on model
             no_repomap: false,
             timeout: None,
+            local_server_url: None,
         }
     }
 }
@@ -247,10 +244,24 @@ impl Config {
     pub fn default_with_auto_detection() -> Self {
         let mut config = Self::default();
         
-        // On macOS, prefer MLX if available (no API key required)
-        if cfg!(target_os = "macos") && Self::is_mlx_available() {
+        // Prefer local models if available (no API key required)
+        if Self::is_candle_available() {
             config.provider = "mlx".to_string();
-            config.model = "mlx-community/Llama-3.2-3B-Instruct-4bit".to_string();
+            
+            // Apple Silicon optimized defaults - prefer native MLX with Qwen models
+            #[cfg(target_arch = "aarch64")]
+            {
+                config.model = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".to_string();
+                config.local_server_url = Some("native-mlx".to_string()); // Native MLX integration
+            }
+            
+            // Intel/AMD64 defaults
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                config.model = "llama3.2".to_string();
+                config.local_server_url = Some("http://localhost:11434".to_string()); // Ollama
+            }
+            
             return config;
         }
         
@@ -270,28 +281,10 @@ impl Config {
         config
     }
     
-    /// Check if MLX is available on this system
-    pub fn is_mlx_available() -> bool {
-        // Check if we can find the MLX server script
-        let current_dir = std::env::current_dir().unwrap_or_default();
-        let script_path = current_dir.join("scripts").join("mlx_server.py");
-        
-        if !script_path.exists() {
-            return false;
-        }
-        
-        // Try to run a quick Python check for MLX availability
-        match std::process::Command::new("python3")
-            .arg("-c")
-            .arg("import mlx.core; print('available')")
-            .output()
-        {
-            Ok(output) => {
-                output.status.success() && 
-                String::from_utf8_lossy(&output.stdout).contains("available")
-            }
-            Err(_) => false,
-        }
+    /// Check if local models (Candle) are available on this system
+    pub fn is_candle_available() -> bool {
+        // Candle is built into the binary, so it's always available
+        true
     }
 
     pub fn save(&self) -> Result<()> {
@@ -315,9 +308,8 @@ impl Config {
             "anthropic" => self.anthropic_api_key.as_deref(),
             "openai" => self.openai_api_key.as_deref(),
             "groq" => self.groq_api_key.as_deref(),
-            "together" => self.together_api_key.as_deref(),
-            "openrouter" => self.openrouter_api_key.as_deref(),
-            "mlx" => Some("mlx-local"), // MLX uses local server
+            "mlx" => Some("local-models"), // Uses local server
+            _ if self.is_local_model() => Some("local-auth-bypass"),
             _ => None,
         }
     }
@@ -334,20 +326,23 @@ impl Config {
             "anthropic" => &self.models.anthropic,
             "openai" => &self.models.openai,
             "groq" => &self.models.groq,
-            "together" => &self.models.together,
-            "openrouter" => &self.models.openrouter,
             "mlx" => &self.models.mlx,
             _ => &self.models.gemini,
         }
     }
     
-    /// Check if using a local model (MLX)
+    /// Check if using a local model (MLX, Ollama, etc.)
     pub fn is_local_model(&self) -> bool {
-        matches!(self.provider.as_str(), "mlx")
+        self.provider == "mlx" || self.local_server_url.is_some()
     }
 
     /// Check if a tool should be auto-approved
     pub fn should_auto_approve(&self, tool_name: &str) -> bool {
+        // Global YOLO override
+        if self.auto_approve.yolo {
+            return true;
+        }
+
         // Specific tool override
         if self.auto_approve.tools.contains(tool_name) {
             return true;

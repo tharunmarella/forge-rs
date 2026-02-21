@@ -23,7 +23,17 @@ fn get_provider_config() -> &'static StdRwLock<Option<EmbeddingProvider>> {
 
 /// Initialize embedding provider from LLM config (call once at startup)
 pub fn init_embedding_provider(provider: &str, api_key: Option<&str>, base_url: Option<&str>) {
-    let embedding_provider = EmbeddingProvider::from_config(provider, api_key, base_url);
+    let is_local = provider == "mlx" || base_url.map_or(false, |u| u.contains("localhost") || u.contains("127.0.0.1") || u == "native-mlx");
+    
+    let embedding_provider = if is_local {
+        tracing::info!("Local model detected, forcing Candle embeddings for offline search");
+        EmbeddingProvider::Candle { 
+            model_name: "sentence-transformers/all-MiniLM-L6-v2".to_string() 
+        }
+    } else {
+        EmbeddingProvider::from_config(provider, api_key, base_url)
+    };
+
     if let Ok(mut guard) = get_provider_config().write() {
         *guard = Some(embedding_provider);
     }

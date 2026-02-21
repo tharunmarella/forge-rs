@@ -116,17 +116,19 @@ impl CheckpointManager {
     
     /// Get diff between current state and a checkpoint
     pub fn diff(&self, checkpoint_id: &str) -> Result<String> {
-        // Sync current state first
-        let mut temp_manager = Self::new(&self.workdir)?;
-        temp_manager.create("temp")?;
+        // Sync workspace files to shadow repo before diffing
+        self.sync_to_shadow()?;
         
         let commit = self.repo.find_commit(git2::Oid::from_str(checkpoint_id)?)?;
         let old_tree = commit.tree()?;
         
-        let head = self.repo.head()?.peel_to_commit()?;
-        let new_tree = head.tree()?;
+        // Compare the checkpoint tree against the current shadow workdir
+        let mut opts = git2::DiffOptions::new();
+        opts.include_untracked(true);
+        opts.recurse_untracked_dirs(true);
+        opts.show_untracked_content(true);
         
-        let diff = self.repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)?;
+        let diff = self.repo.diff_tree_to_workdir_with_index(Some(&old_tree), Some(&mut opts))?;
         
         let mut output = String::new();
         diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {

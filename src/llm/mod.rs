@@ -5,31 +5,57 @@ use crate::config::Config;
 use anyhow::Result;
 
 pub mod tools;
-pub mod mlx_manager;
+pub mod candle_manager;
+pub mod candle_client;
+pub mod mlx_native;
+pub mod mlx_client;
 
 pub fn create_openai_agent_builder(config: &Config) -> Result<AgentBuilder<openai::responses_api::ResponsesCompletionModel>> {
-    let client = openai::Client::from_env();
+    let client = if let Some(key) = &config.openai_api_key {
+        openai::Client::new(key)?
+    } else {
+        openai::Client::from_env()
+    };
     Ok(client.agent(&config.model))
 }
 
 pub fn create_anthropic_agent_builder(config: &Config) -> Result<AgentBuilder<anthropic::completion::CompletionModel>> {
-    let client = anthropic::Client::from_env();
+    let client = if let Some(key) = &config.anthropic_api_key {
+        anthropic::Client::new(key)?
+    } else {
+        anthropic::Client::from_env()
+    };
     Ok(client.agent(&config.model))
 }
 
 pub fn create_gemini_agent_builder(config: &Config) -> Result<AgentBuilder<gemini::completion::CompletionModel>> {
-    let client = gemini::Client::from_env();
+    let client = if let Some(key) = &config.gemini_api_key {
+        gemini::Client::new(key)?
+    } else {
+        gemini::Client::from_env()
+    };
     Ok(client.agent(&config.model))
 }
 
-pub async fn create_mlx_agent_builder(config: &Config) -> Result<AgentBuilder<openai::responses_api::ResponsesCompletionModel>> {
-    // Ensure MLX server is running automatically
-    let base_url = mlx_manager::ensure_mlx_server_running(&config.model).await?;
+pub async fn create_candle_agent_builder(config: &Config) -> Result<rig::agent::AgentBuilder<candle_client::CandleCompletionModel>> {
+    // Initialize Candle manager if not already done
+    if !candle_manager::is_candle_available().await {
+        // Use custom server URL if provided, otherwise auto-detect
+        if let Some(server_url) = &config.local_server_url {
+            candle_manager::init_candle_manager_with_url(config.model.clone(), server_url.clone()).await?;
+        } else {
+            candle_manager::init_candle_manager(config.model.clone()).await?;
+        }
+    }
     
-    // Set environment variables for the OpenAI client to use our local MLX server
-    std::env::set_var("OPENAI_API_KEY", "mlx-local-key");
-    std::env::set_var("OPENAI_BASE_URL", &base_url);
+    Ok(candle_client::create_candle_agent_builder(&config.model))
+}
+
+pub async fn create_mlx_native_agent_builder(config: &Config) -> Result<rig::agent::AgentBuilder<mlx_client::MLXNativeCompletionModel>> {
+    // Initialize native MLX manager if not already done
+    if !mlx_native::is_mlx_native_available().await {
+        mlx_native::init_mlx_native_manager(config.model.clone()).await?;
+    }
     
-    let client = openai::Client::from_env();
-    Ok(client.agent(&config.model))
+    Ok(mlx_client::create_mlx_native_agent_builder(&config.model))
 }

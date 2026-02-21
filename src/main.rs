@@ -170,20 +170,30 @@ async fn main() -> Result<()> {
         cfg = config::Config::load()?;
     }
     
-    // Override with CLI args
+    // Override with CLI args (but preserve auto-detected defaults if not explicitly set)
     if let Some(provider) = cli.provider {
         cfg.provider = provider;
     }
+    
+    // Only override model if explicitly provided AND different from default
+    // Don't override auto-detected MLX models with CLI defaults
     if cli.model != "gemini-2.5-flash" {
         cfg.model = cli.model;
+    } else if cfg.provider == "mlx" && cfg.model.starts_with("mlx-community/") {
+        // Keep the auto-detected MLX model
+    } else if cfg.provider != "mlx" {
+        // For non-MLX providers, use CLI default if no config model set
+        if cfg.model.starts_with("mlx-community/") {
+            // Config has MLX model but we're not using MLX provider
+            cfg.model = cli.model;
+        }
     }
+    
     cfg.plan_mode = cli.plan;
     
     // YOLO mode - auto-approve everything
     if cli.yolo {
-        cfg.auto_approve.read_operations = true;
-        cfg.auto_approve.write_operations = true;
-        cfg.auto_approve.commands = true;
+        cfg.auto_approve.yolo = true;
     }
 
     if cli.no_repomap {

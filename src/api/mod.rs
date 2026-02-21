@@ -14,6 +14,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use std::sync::{Arc, Mutex};
+
 /// Message in conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -34,11 +36,15 @@ pub enum Role {
     Tool,
 }
 
+mod types;
+mod prompts;
+pub use types::{AgentPhase, PlanStep};
+
 pub enum RigAgentEnum {
     OpenAI(RigAgent<openai::responses_api::ResponsesCompletionModel>),
     Anthropic(RigAgent<anthropic::completion::CompletionModel>),
     Gemini(RigAgent<gemini::completion::CompletionModel>),
-    MLX(RigAgent<openai::responses_api::ResponsesCompletionModel>),
+    MLX(RigAgent<crate::llm::mlx_client::MLXNativeCompletionModel>),
 }
 
 /// The main agent that orchestrates everything
@@ -50,7 +56,15 @@ pub struct Agent {
     doc_prefetcher: DocPrefetcher,
     repo_map: String,
     session: Option<Session>,
-    pub rig_agent: Option<RigAgentEnum>,
+    
+    // Tri-Model Architecture
+    pub planner: Option<RigAgentEnum>,
+    pub reasoner: Option<RigAgentEnum>,
+    pub tool_caller: Option<RigAgentEnum>,
+    
+    pub current_phase: AgentPhase,
+    pub plan: Vec<PlanStep>,
+    pub tool_state: Arc<Mutex<crate::llm::tools::AgentState>>,
 }
 
 impl Agent {
@@ -79,16 +93,23 @@ impl Agent {
         // Create new session
         let session = Session::new(workdir.clone(), &config.provider, &config.model);
         
+        let tool_state = Arc::new(Mutex::new(crate::llm::tools::AgentState::default()));
+
         let mut agent = Self {
             config,
             workdir,
             context,
             messages: Vec::new(),
             doc_prefetcher: DocPrefetcher::new(),
-            repo_map,
-            session: Some(session),
-            rig_agent: None,
-        };
+                        repo_map,
+                        session: Some(session),
+                        planner: None,
+                        reasoner: None,
+                        tool_caller: None,
+                        current_phase: AgentPhase::Explore,
+                        plan: Vec::new(),
+                        tool_state,
+                    };
         
         agent.init_rig_agent().await?;
         
@@ -96,7 +117,33 @@ impl Agent {
     }
     
     async fn init_rig_agent(&mut self) -> Result<()> {
-        // Add tools
+        let preamble = self.build_system_prompt();
+        
+        // Initialize Planner
+        let mut planner_config = self.config.clone();
+        if let Some(m) = &self.config.planner_model {
+            planner_config.model = m.clone();
+        }
+        self.planner = Some(self.create_agent_enum(&planner_config, &preamble, self.create_rig_tools()).await?);
+
+        // Initialize Reasoner
+        let mut reasoner_config = self.config.clone();
+        if let Some(m) = &self.config.reasoner_model {
+            reasoner_config.model = m.clone();
+        }
+        self.reasoner = Some(self.create_agent_enum(&reasoner_config, &preamble, self.create_rig_tools()).await?);
+
+        // Initialize Tool Caller
+        let mut tool_config = self.config.clone();
+        if let Some(m) = &self.config.tool_model {
+            tool_config.model = m.clone();
+        }
+        self.tool_caller = Some(self.create_agent_enum(&tool_config, &preamble, self.create_rig_tools()).await?);
+        
+        Ok(())
+    }
+
+    fn create_rig_tools(&self) -> Vec<Box<dyn ToolDyn>> {
         let tool_defs = tools::definitions(self.config.plan_mode);
         let mut rig_tools: Vec<Box<dyn ToolDyn>> = Vec::new();
         
@@ -111,44 +158,45 @@ impl Agent {
                 parameters,
                 workdir: self.workdir.clone(),
                 plan_mode: self.config.plan_mode,
+                state: self.tool_state.clone(),
             }));
         }
-        
-        let preamble = self.build_system_prompt();
-        
-        match self.config.provider.as_str() {
+        rig_tools
+    }
+
+    /// Helper to create a RigAgentEnum based on config
+    async fn create_agent_enum(&self, config: &Config, preamble: &str, tools: Vec<Box<dyn ToolDyn>>) -> Result<RigAgentEnum> {
+        match config.provider.as_str() {
             "openai" | "groq" | "together" | "openrouter" => {
-                let rig_agent = llm::create_openai_agent_builder(&self.config)?
-                    .preamble(&preamble)
-                    .tools(rig_tools)
+                let agent = llm::create_openai_agent_builder(config)?
+                    .preamble(preamble)
+                    .tools(tools)
                     .build();
-                self.rig_agent = Some(RigAgentEnum::OpenAI(rig_agent));
+                Ok(RigAgentEnum::OpenAI(agent))
             }
             "anthropic" => {
-                let rig_agent = llm::create_anthropic_agent_builder(&self.config)?
-                    .preamble(&preamble)
-                    .tools(rig_tools)
+                let agent = llm::create_anthropic_agent_builder(config)?
+                    .preamble(preamble)
+                    .tools(tools)
                     .build();
-                self.rig_agent = Some(RigAgentEnum::Anthropic(rig_agent));
+                Ok(RigAgentEnum::Anthropic(agent))
             }
             "gemini" => {
-                let rig_agent = llm::create_gemini_agent_builder(&self.config)?
-                    .preamble(&preamble)
-                    .tools(rig_tools)
+                let agent = llm::create_gemini_agent_builder(config)?
+                    .preamble(preamble)
+                    .tools(tools)
                     .build();
-                self.rig_agent = Some(RigAgentEnum::Gemini(rig_agent));
+                Ok(RigAgentEnum::Gemini(agent))
             }
             "mlx" => {
-                let rig_agent = llm::create_mlx_agent_builder(&self.config).await?
-                    .preamble(&preamble)
-                    .tools(rig_tools)
+                let agent = llm::create_mlx_native_agent_builder(config).await?
+                    .preamble(preamble)
+                    .tools(tools)
                     .build();
-                self.rig_agent = Some(RigAgentEnum::MLX(rig_agent));
+                Ok(RigAgentEnum::MLX(agent))
             }
-            _ => return Err(anyhow::anyhow!("Unknown provider: {}", self.config.provider)),
+            _ => Err(anyhow::anyhow!("Unknown provider: {}", config.provider)),
         }
-        
-        Ok(())
     }
 
     /// Create agent and resume from a previous session
@@ -173,6 +221,8 @@ impl Agent {
         let session = Session::load(session_id)?;
         let messages = session.messages.clone();
         
+        let tool_state = Arc::new(Mutex::new(crate::llm::tools::AgentState::default()));
+
         let mut agent = Self {
             config,
             workdir,
@@ -181,7 +231,12 @@ impl Agent {
             doc_prefetcher: DocPrefetcher::new(),
             repo_map,
             session: Some(session),
-            rig_agent: None,
+            planner: None,
+            reasoner: None,
+            tool_caller: None,
+            current_phase: AgentPhase::Explore,
+            plan: Vec::new(),
+            tool_state,
         };
         
         agent.init_rig_agent().await?;
@@ -212,50 +267,90 @@ impl Agent {
         self.session.as_ref().map(|s| s.id.as_str())
     }
 
-    /// Run a single prompt with streaming output
+    /// Run a single prompt with a multi-turn reasoning loop
     pub async fn run_prompt(&mut self, prompt: &str) -> Result<()> {
         println!("📝 Task: {prompt}\n");
 
         // Start background doc prefetch for this query
         self.doc_prefetcher.prefetch_async(prompt.to_string());
 
-        let rig_agent = self.rig_agent.as_ref().ok_or_else(|| anyhow::anyhow!("Rig agent not initialized"))?;
-        
-        // Convert existing messages to Rig format
-        let mut rig_history: Vec<RigMessage> = Vec::new();
-        for msg in &self.messages {
-            match msg.role {
-                Role::User => rig_history.push(RigMessage::user(&msg.content)),
-                Role::Assistant => rig_history.push(RigMessage::assistant(&msg.content)),
-                _ => {} // Rig handles tool messages internally during chat
-            }
+        // Initial phase
+        self.current_phase = AgentPhase::Explore;
+        {
+            let mut state = self.tool_state.lock().unwrap();
+            state.current_phase = AgentPhase::Explore;
         }
 
-        // Use Rig's chat interface
-        let response = match rig_agent {
-            RigAgentEnum::OpenAI(agent) => agent.chat(prompt, rig_history).await?,
-            RigAgentEnum::Anthropic(agent) => agent.chat(prompt, rig_history).await?,
-            RigAgentEnum::Gemini(agent) => agent.chat(prompt, rig_history).await?,
-            RigAgentEnum::MLX(agent) => agent.chat(prompt, rig_history).await?,
-        };
-        
-        println!("{}", response);
-        
-        self.messages.push(Message {
-            role: Role::User,
-            content: prompt.to_string(),
-            tool_calls: None,
-            tool_results: None,
-        });
-        
-        self.messages.push(Message {
-            role: Role::Assistant,
-            content: response,
-            tool_calls: None,
-            tool_results: None,
-        });
-        
-        self.save_session().ok();
+        let mut turn_count = 0;
+        let max_turns = 15;
+        let mut current_input = prompt.to_string();
+
+        while turn_count < max_turns {
+            turn_count += 1;
+            
+            // Route to appropriate model based on phase
+            let rig_agent = match self.current_phase {
+                AgentPhase::Explore | AgentPhase::Think => self.planner.as_ref(),
+                AgentPhase::Verify => self.reasoner.as_ref(),
+                AgentPhase::Execute => self.tool_caller.as_ref(),
+            }.ok_or_else(|| anyhow::anyhow!("Rig agent for phase {:?} not initialized", self.current_phase))?;
+            
+            // Convert existing messages to Rig format
+            let mut rig_history: Vec<RigMessage> = Vec::new();
+            for msg in &self.messages {
+                match msg.role {
+                    Role::User => rig_history.push(RigMessage::user(&msg.content)),
+                    Role::Assistant => rig_history.push(RigMessage::assistant(&msg.content)),
+                    _ => {} 
+                }
+            }
+
+            // Use Rig's chat interface
+            let response = match rig_agent {
+                RigAgentEnum::OpenAI(agent) => agent.chat(&current_input, rig_history).await?,
+                RigAgentEnum::Anthropic(agent) => agent.chat(&current_input, rig_history).await?,
+                RigAgentEnum::Gemini(agent) => agent.chat(&current_input, rig_history).await?,
+                RigAgentEnum::MLX(agent) => agent.chat(&current_input, rig_history).await?,
+            };
+            
+            println!("\n🤖 Turn {}:\n{}\n", turn_count, response);
+            
+            // Sync state from tools
+            {
+                let state = self.tool_state.lock().unwrap();
+                self.current_phase = state.current_phase;
+                self.plan = state.plan.clone();
+            }
+
+            // Record messages
+            self.messages.push(Message {
+                role: Role::User,
+                content: current_input.clone(),
+                tool_calls: None,
+                tool_results: None,
+            });
+            
+            self.messages.push(Message {
+                role: Role::Assistant,
+                content: response.clone(),
+                tool_calls: None,
+                tool_results: None,
+            });
+
+            self.save_session().ok();
+
+            // Check for completion or termination
+            if response.contains("attempt_completion") || response.contains("ask_followup_question") {
+                break;
+            }
+
+            // If we're just continuing, prepare for next turn
+            current_input = "Continue with the next step in your plan or phase.".to_string();
+        }
+
+        if turn_count >= max_turns {
+            println!("⚠️ Reached maximum reasoning turns ({})", max_turns);
+        }
 
         Ok(())
     }
@@ -267,7 +362,15 @@ impl Agent {
 
     fn build_system_prompt(&self) -> String {
         let mode = if self.config.plan_mode { "PLAN" } else { "ACT" };
+        let phase_str = format!("{:?}", self.current_phase).to_uppercase();
         
+        let core_preamble = match self.current_phase {
+            AgentPhase::Explore => prompts::MASTER_PLANNING_PROMPT,
+            AgentPhase::Think => prompts::THINK_PROMPT,
+            AgentPhase::Execute => prompts::SYSTEM_PROMPT,
+            AgentPhase::Verify => prompts::REPLAN_PROMPT,
+        };
+
         // Get any prefetched documentation
         let prefetched_docs = self.doc_prefetcher.get_cached_docs_for_prompt();
         
@@ -283,30 +386,32 @@ The following shows key symbols and their locations in the codebase:
         } else {
             String::new()
         };
+
+        // Include plan if present
+        let plan_section = if !self.plan.is_empty() {
+            let mut s = String::from("\n# Current Plan\n");
+            for step in &self.plan {
+                let status = match step.status.as_str() {
+                    "done" => "✅",
+                    "in_progress" => "🟡",
+                    "failed" => "❌",
+                    _ => "⏳",
+                };
+                s.push_str(&format!("{} {}. {}\n", status, step.number, step.description));
+            }
+            s
+        } else {
+            String::new()
+        };
         
-        format!(r#"You are Forge, a CLI coding agent. Mode: {mode}
+        format!(r#"{core_preamble}
+
+# Context: {mode} | Phase: {phase_str}
 
 # Environment
 - Working directory: {}
 - Files: {}
-{repo_map_section}
-# Tools
-You have access to tools for file operations, code search, and web access.
-
-## Search Strategy
-- `codebase_search`: Use for conceptual/semantic queries ("how does X work", "find code related to Y")
-- `grep`: Use ONLY for exact text/literal matches (function names, error strings, TODOs)
-- `glob`: Use to find files by name pattern (*.rs, test_*.py)
-- `get_symbol_definition`: Use to jump to a specific symbol's definition
-
-Always read files before editing.
-
-# Rules
-1. Be concise and direct
-2. Use tools efficiently - batch reads when possible
-3. Always verify changes with read_file after editing
-4. Use attempt_completion when done
-5. Ask clarifying questions if needed
+{repo_map_section}{plan_section}
 
 {}
 {}"#,
@@ -353,22 +458,14 @@ fn truncate(s: &str, max: usize) -> String {
 impl Agent {
     /// Gracefully shutdown the agent and any managed resources
     pub async fn shutdown(&mut self) -> Result<()> {
-        // Stop MLX server if it was started by this agent
-        if matches!(self.config.provider.as_str(), "mlx") {
-            if let Err(e) = crate::llm::mlx_manager::stop_mlx_server().await {
-                tracing::warn!("Failed to stop MLX server during shutdown: {}", e);
-            }
-        }
+        // MLX native implementation doesn't require explicit shutdown
+        // Resources are automatically cleaned up when dropped
         Ok(())
     }
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
-        // Best effort cleanup - can't use async in Drop
-        if matches!(self.config.provider.as_str(), "mlx") {
-            // Try to stop the server synchronously
-            let _ = futures::executor::block_on(crate::llm::mlx_manager::stop_mlx_server());
-        }
+        // MLX native implementation handles cleanup automatically
     }
 }

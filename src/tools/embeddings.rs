@@ -2,15 +2,12 @@ use anyhow::Result;
 use rig::client::EmbeddingsClient;
 use rig::embeddings::EmbeddingsBuilder;
 use rig::providers::{openai, gemini};
-use serde_json;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid;
 use walkdir::WalkDir;
 
-/// Embedding provider type using rig-core models and MLX
+/// Embedding provider type using rig-core models and local models
 #[derive(Clone)]
 pub enum EmbeddingProvider {
     /// OpenAI embeddings (works with OpenAI-compatible APIs)
@@ -19,8 +16,8 @@ pub enum EmbeddingProvider {
     Gemini(gemini::EmbeddingModel),
     /// Anthropic (uses OpenAI-compatible endpoint)
     Anthropic(openai::EmbeddingModel),
-    /// MLX local embeddings (Apple Silicon optimized)
-    MLX { model_name: String },
+    /// Local embeddings (Candle-rs based)
+    Candle { model_name: String },
     /// Disabled (no embeddings - semantic search unavailable)
     None,
 }
@@ -31,7 +28,7 @@ impl std::fmt::Debug for EmbeddingProvider {
             EmbeddingProvider::OpenAI(_) => write!(f, "OpenAI"),
             EmbeddingProvider::Gemini(_) => write!(f, "Gemini"),
             EmbeddingProvider::Anthropic(_) => write!(f, "Anthropic"),
-            EmbeddingProvider::MLX { model_name } => write!(f, "MLX({})", model_name),
+            EmbeddingProvider::Candle { model_name } => write!(f, "Local({})", model_name),
             EmbeddingProvider::None => write!(f, "None"),
         }
     }
@@ -75,7 +72,7 @@ impl EmbeddingProvider {
                     }
                 }
             },
-            "groq" | "together" | "openrouter" => {
+            "groq" => {
                 if api_key.is_empty() {
                     tracing::warn!("{} API key not provided, embeddings disabled", provider);
                     return EmbeddingProvider::None;
@@ -103,23 +100,16 @@ impl EmbeddingProvider {
                 }
             },
             "mlx" => {
-                // MLX local embeddings for Apple Silicon
-                let model_name = _base_url.unwrap_or("mlx-community/all-MiniLM-L6-v2-4bit").to_string();
-                EmbeddingProvider::MLX { model_name }
+                // MLX doesn't support embedding models yet in mlx-lm
+                // Disable embeddings for now
+                tracing::info!("MLX embeddings not yet supported, disabling semantic search");
+                EmbeddingProvider::None
             },
-            // Default: try MLX first (for Apple Silicon), then disable
+            // Default: try local models fallback, then disable
             _ => {
-                #[cfg(target_os = "macos")]
-                {
-                    tracing::info!("Provider {} doesn't support embeddings, trying MLX fallback", provider);
-                    EmbeddingProvider::MLX { 
-                        model_name: "mlx-community/all-MiniLM-L6-v2-4bit".to_string() 
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    tracing::info!("Provider {} doesn't support embeddings, disabled", provider);
-                    EmbeddingProvider::None
+                tracing::info!("Provider {} doesn't support embeddings, trying local models fallback", provider);
+                EmbeddingProvider::Candle { 
+                    model_name: "sentence-transformers/all-MiniLM-L6-v2".to_string() 
                 }
             },
         }
@@ -169,8 +159,8 @@ impl EmbeddingStore {
             EmbeddingProvider::Gemini(model) => {
                 self.embed_with_rig_gemini(texts, model).await
             }
-            EmbeddingProvider::MLX { model_name } => {
-                self.embed_with_mlx(texts, model_name).await
+            EmbeddingProvider::Candle { model_name } => {
+                self.embed_with_candle(texts, model_name).await
             }
             EmbeddingProvider::None => {
                 // Return zero vectors (embeddings disabled)
@@ -225,110 +215,27 @@ impl EmbeddingStore {
         Ok(results)
     }
 
-    /// Generate embeddings using MLX (Apple Silicon optimized)
-    async fn embed_with_mlx(
+    /// Generate embeddings using local models (Apple Silicon optimized)
+    async fn embed_with_candle(
         &self,
         texts: &[&str],
-        model_name: &str,
+        _model_name: &str,
     ) -> Result<Vec<Vec<f32>>> {
-        // Find the MLX embeddings script
-        let script_path = self.find_mlx_script()?;
+        // Check if we should use native MLX or HTTP-based approach
+        // For now, use HTTP-based approach to avoid thread safety issues in background tasks
+        // TODO: Implement proper Send/Sync for MLX native manager
+        use crate::llm::candle_manager::get_candle_manager;
         
-        // Prepare input data
-        let input_data = serde_json::json!({
-            "texts": texts
-        });
+        let manager = get_candle_manager().await?;
         
-        // Create temporary files for communication
-        let temp_dir = std::env::temp_dir();
-        let input_file = temp_dir.join(format!("mlx_input_{}.json", uuid::Uuid::new_v4()));
-        let output_file = temp_dir.join(format!("mlx_output_{}.json", uuid::Uuid::new_v4()));
-        
-        // Write input data
-        tokio::fs::write(&input_file, serde_json::to_string(&input_data)?).await?;
-        
-        // Execute MLX embeddings script
-        let output = Command::new("python3")
-            .arg(&script_path)
-            .arg("--model")
-            .arg(model_name)
-            .arg("--input")
-            .arg(&input_file)
-            .arg("--output")
-            .arg(&output_file)
-            .output()?;
-        
-        // Clean up input file
-        let _ = tokio::fs::remove_file(&input_file).await;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("MLX embeddings failed: {}", stderr));
+        // Generate embeddings for each text
+        let mut embeddings = Vec::new();
+        for text in texts {
+            let embedding = manager.embed(text).await?;
+            embeddings.push(embedding);
         }
         
-        // Read output data
-        let output_data = tokio::fs::read_to_string(&output_file).await?;
-        let _ = tokio::fs::remove_file(&output_file).await;
-        
-        let result: serde_json::Value = serde_json::from_str(&output_data)?;
-        
-        // Check for errors
-        if let Some(error) = result.get("error") {
-            return Err(anyhow::anyhow!("MLX embeddings error: {}", error));
-        }
-        
-        // Extract embeddings
-        let embeddings = result.get("embeddings")
-            .ok_or_else(|| anyhow::anyhow!("No embeddings in MLX response"))?
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Embeddings is not an array"))?;
-        
-        let mut result_embeddings = Vec::new();
-        for embedding in embeddings {
-            let embedding_array = embedding.as_array()
-                .ok_or_else(|| anyhow::anyhow!("Embedding is not an array"))?;
-            
-            let embedding_vec: Result<Vec<f32>, _> = embedding_array
-                .iter()
-                .map(|v| v.as_f64().ok_or_else(|| anyhow::anyhow!("Invalid embedding value")).map(|f| f as f32))
-                .collect();
-            
-            result_embeddings.push(embedding_vec?);
-        }
-        
-        Ok(result_embeddings)
-    }
-    
-    /// Find the MLX embeddings script path
-    fn find_mlx_script(&self) -> Result<PathBuf> {
-        // Try relative to current executable
-        let exe_path = std::env::current_exe()?;
-        let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("No parent directory"))?;
-        
-        // Check ../scripts/mlx_embeddings.py (development)
-        let dev_script = exe_dir.parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("scripts").join("mlx_embeddings.py"));
-        
-        if let Some(script) = dev_script {
-            if script.exists() {
-                return Ok(script);
-            }
-        }
-        
-        // Check ./scripts/mlx_embeddings.py (relative to exe)
-        let rel_script = exe_dir.join("scripts").join("mlx_embeddings.py");
-        if rel_script.exists() {
-            return Ok(rel_script);
-        }
-        
-        // Check current working directory
-        let cwd_script = std::env::current_dir()?.join("scripts").join("mlx_embeddings.py");
-        if cwd_script.exists() {
-            return Ok(cwd_script);
-        }
-        
-        Err(anyhow::anyhow!("MLX embeddings script not found. Expected at scripts/mlx_embeddings.py"))
+        Ok(embeddings)
     }
 
 

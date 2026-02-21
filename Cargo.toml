@@ -13,14 +13,12 @@ members = []
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+async-stream = "0.3"
 
 # CLI & TUI
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
-termimad = "0.31"
-tui-textarea = { version = "0.4", features = ["crossterm"] }
-throbber-widgets-tui = "0.8"
 
 # HTTP & API
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -32,6 +30,14 @@ serde_json = "1"
 # LLM Framework
 rig-core = "0.30"
 async-trait = "0.1"
+
+# Native MLX integration for Apple Silicon
+mlx-rs = { version = "0.25.3", features = ["metal", "accelerate"] }
+mlx-lm = "0.0.1"
+mlx-lm-utils = "0.0.1"
+tokenizers = "0.19.1"
+hf-hub = { version = "0.4", features = ["tokio"] }
+safetensors = "0.4.1"
 
 
 # File watching & operations
@@ -66,6 +72,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
+indicatif = "0.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 similar = "2"
 shellexpand = "3"

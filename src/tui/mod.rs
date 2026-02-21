@@ -352,13 +352,18 @@ async fn send_message(_terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &
         }
     }
 
-    // Use Rig's chat interface
-    let response: String = match &app.agent.rig_agent {
-        Some(crate::api::RigAgentEnum::OpenAI(agent)) => agent.chat(prompt, rig_history).await?,
-        Some(crate::api::RigAgentEnum::Anthropic(agent)) => agent.chat(prompt, rig_history).await?,
-        Some(crate::api::RigAgentEnum::Gemini(agent)) => agent.chat(prompt, rig_history).await?,
-        Some(crate::api::RigAgentEnum::MLX(agent)) => agent.chat(prompt, rig_history).await?,
-        None => return Err(anyhow::anyhow!("Rig agent not initialized")),
+    // Use Rig's chat interface with Tri-Model selection
+    let agent_enum = match app.agent.current_phase {
+        crate::api::AgentPhase::Explore | crate::api::AgentPhase::Think => &app.agent.planner,
+        crate::api::AgentPhase::Verify => &app.agent.reasoner,
+        crate::api::AgentPhase::Execute => &app.agent.tool_caller,
+    }.as_ref().ok_or_else(|| anyhow::anyhow!("Rig agent for phase {:?} not initialized", app.agent.current_phase))?;
+
+    let response: String = match agent_enum {
+        crate::api::RigAgentEnum::OpenAI(agent) => agent.chat(prompt, rig_history).await?,
+        crate::api::RigAgentEnum::Anthropic(agent) => agent.chat(prompt, rig_history).await?,
+        crate::api::RigAgentEnum::Gemini(agent) => agent.chat(prompt, rig_history).await?,
+        crate::api::RigAgentEnum::MLX(agent) => agent.chat(prompt, rig_history).await?,
     };
     
     app.is_thinking = false;

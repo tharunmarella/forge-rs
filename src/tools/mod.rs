@@ -69,6 +69,13 @@ pub enum Tool {
     AttemptCompletion,
     AskFollowupQuestion,
     Think,
+
+    // Planning
+    CreatePlan,
+    UpdatePlan,
+    AddPlanStep,
+    RemovePlanStep,
+    DiscardPlan,
     
     // Mode control (internal)
     PlanModeRespond,
@@ -116,6 +123,11 @@ impl Tool {
             Self::AttemptCompletion => "attempt_completion",
             Self::AskFollowupQuestion => "ask_followup_question",
             Self::Think => "think",
+            Self::CreatePlan => "create_plan",
+            Self::UpdatePlan => "update_plan",
+            Self::AddPlanStep => "add_plan_step",
+            Self::RemovePlanStep => "remove_plan_step",
+            Self::DiscardPlan => "discard_plan",
             Self::PlanModeRespond => "plan_mode_respond",
             Self::ActModeRespond => "act_mode_respond",
             Self::FocusChain => "focus_chain",
@@ -165,6 +177,11 @@ impl Tool {
             "attempt_completion" => Some(Self::AttemptCompletion),
             "ask_followup_question" => Some(Self::AskFollowupQuestion),
             "think" => Some(Self::Think),
+            "create_plan" => Some(Self::CreatePlan),
+            "update_plan" => Some(Self::UpdatePlan),
+            "add_plan_step" => Some(Self::AddPlanStep),
+            "remove_plan_step" => Some(Self::RemovePlanStep),
+            "discard_plan" => Some(Self::DiscardPlan),
             "plan_mode_respond" => Some(Self::PlanModeRespond),
             "act_mode_respond" => Some(Self::ActModeRespond),
             "focus_chain" => Some(Self::FocusChain),
@@ -449,6 +466,11 @@ pub async fn execute(tool: &ToolCall, workdir: &Path, plan_mode: bool) -> ToolRe
         | Tool::PlanModeRespond
         | Tool::ActModeRespond
         | Tool::FocusChain
+        | Tool::CreatePlan
+        | Tool::UpdatePlan
+        | Tool::AddPlanStep
+        | Tool::RemovePlanStep
+        | Tool::DiscardPlan
         | Tool::Think => ToolResult::ok(""),
     };
     
@@ -825,6 +847,12 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             !matches!(name, "execute_command" | "write_to_file" | "replace_in_file" | "apply_patch" | "execute_background" | "kill_process" | "kill_port")
         });
     }
+    
+    // TEMPORARY: Remove attempt_completion to debug Gemini duplicate error
+    tools.retain(|t| {
+        let name = t["name"].as_str().unwrap_or("");
+        name != "attempt_completion"
+    });
 
     tools
 }
