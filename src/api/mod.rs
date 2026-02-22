@@ -42,6 +42,7 @@ pub use types::{AgentPhase, PlanStep};
 
 pub enum RigAgentEnum {
     OpenAI(RigAgent<openai::responses_api::ResponsesCompletionModel>),
+    Local(RigAgent<openai::completion::CompletionModel>),  // for mlx_lm.server and other local OpenAI-compatible servers
     Anthropic(RigAgent<anthropic::completion::CompletionModel>),
     Gemini(RigAgent<gemini::completion::CompletionModel>),
 }
@@ -163,17 +164,17 @@ impl Agent {
                 Ok(RigAgentEnum::Gemini(agent))
             }
             "mlx" => {
-                // MLX runs via mlx_lm.server — an OpenAI-compatible HTTP server on localhost
-                // Start with: python -m mlx_lm.server --model <model>
-                let mut mlx_config = config.clone();
-                if mlx_config.base_url.is_none() || mlx_config.base_url.as_deref() == Some("native-mlx") {
-                    mlx_config.base_url = Some("http://localhost:8000/v1".to_string());
-                }
-                let agent = llm::create_openai_agent_builder(&mlx_config)?
+                // mlx_lm.server — uses /v1/chat/completions (NOT the OpenAI Responses API)
+                let base_url = config.base_url.as_deref()
+                    .filter(|u| *u != "native-mlx")
+                    .unwrap_or("http://localhost:8000/v1");
+                // Auto-start the server if it isn't already running
+                llm::ensure_mlx_server(base_url, &config.model).await?;
+                let agent = llm::create_local_agent_builder(base_url, &config.model)?
                     .preamble(preamble)
                     .tools(tools)
                     .build();
-                Ok(RigAgentEnum::OpenAI(agent))
+                Ok(RigAgentEnum::Local(agent))
             }
             _ => Err(anyhow::anyhow!("Unknown provider: {}", config.provider)),
         }
@@ -282,6 +283,7 @@ impl Agent {
         // One call — rig handles the internal tool-call / result loop
         let response = match rig_agent {
             RigAgentEnum::OpenAI(agent) => agent.chat(&augmented_prompt, rig_history).await?,
+            RigAgentEnum::Local(agent) => agent.chat(&augmented_prompt, rig_history).await?,
             RigAgentEnum::Anthropic(agent) => agent.chat(&augmented_prompt, rig_history).await?,
             RigAgentEnum::Gemini(agent) => agent.chat(&augmented_prompt, rig_history).await?,
         };

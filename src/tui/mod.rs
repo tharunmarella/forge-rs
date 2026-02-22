@@ -363,6 +363,7 @@ async fn send_message(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
 
     let response: String = match agent_enum {
         crate::api::RigAgentEnum::OpenAI(agent) => agent.chat(prompt, rig_history).await?,
+        crate::api::RigAgentEnum::Local(agent) => agent.chat(prompt, rig_history).await?,
         crate::api::RigAgentEnum::Anthropic(agent) => agent.chat(prompt, rig_history).await?,
         crate::api::RigAgentEnum::Gemini(agent) => agent.chat(prompt, rig_history).await?,
     };
