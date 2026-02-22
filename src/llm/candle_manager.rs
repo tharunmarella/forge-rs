@@ -414,8 +414,10 @@ pub fn get_optimal_mlx_config() -> (String, String, u16) {
                     match mem_gb {
                         0..=8  => "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit",
                         9..=16 => "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
-                        17..=32 => "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
-                        _ => "mlx-community/Qwen3-Coder-Next-4bit",
+                        17..=24 => "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit-dwq-v2",
+                        25..=36 => "mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit",
+                        37..=63 => "mlx-community/Qwen3-Coder-Next-4bit",
+                        _ => "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit",
                     }
                 } else {
                     "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" // Safe default

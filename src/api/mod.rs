@@ -286,6 +286,7 @@ impl Agent {
             RigAgentEnum::Gemini(agent) => agent.chat(&augmented_prompt, rig_history).await?,
         };
 
+        let response = strip_thinking(&response);
         println!("\n{}\n", response);
 
         // Sync any plan updates written by tools
@@ -448,6 +449,31 @@ pub enum AgentResponse {
     ToolCalls { text: String, calls: Vec<ToolCall> },
     Completion(String),
     Question(String),
+}
+
+/// Strip thinking/reasoning blocks emitted by thinking models (Qwen3, etc.)
+/// Handles both <think>...</think> and bare content...</think> (no opening tag).
+fn strip_thinking(text: &str) -> String {
+    if let Some(end) = text.rfind("</think>") {
+        return text[end + "</think>".len()..].trim().to_string();
+    }
+    let mut result = String::new();
+    let mut remaining = text;
+    loop {
+        match remaining.find("<think>") {
+            None => { result.push_str(remaining); break; }
+            Some(start) => {
+                result.push_str(&remaining[..start]);
+                match remaining[start..].find("</think>") {
+                    None => break,
+                    Some(rel_end) => {
+                        remaining = &remaining[start + rel_end + "</think>".len()..];
+                    }
+                }
+            }
+        }
+    }
+    result.trim().to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {

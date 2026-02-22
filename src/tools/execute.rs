@@ -100,38 +100,77 @@ pub async fn run(args: &Value, workdir: &Path) -> ToolResult {
     }
 }
 
-/// Collect stdout + stderr from a child process.
+/// Collect stdout + stderr from a child process concurrently.
+/// Reading both streams in parallel prevents the classic deadlock where the
+/// child fills its stderr pipe buffer while we are blocked draining stdout
+/// (or vice-versa), causing the child to hang indefinitely.
 /// Returns (output_string, was_truncated, exit_code).
 async fn collect_output(
     child: &mut tokio::process::Child,
 ) -> (String, bool, i32) {
+    use tokio::sync::mpsc;
+
+    // Each stream sends lines to a shared channel so we can interleave them
+    // in arrival order without blocking either pipe.
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    let stdout_tx = tx.clone();
+    let stderr_tx = tx;
+
+    // Drain stdout in a separate task
+    let stdout_task = if let Some(stdout) = child.stdout.take() {
+        let mut reader = BufReader::new(stdout).lines();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                if stdout_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+    } else {
+        tokio::spawn(async {})
+    };
+
+    // Drain stderr in a separate task
+    let stderr_task = if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr).lines();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                if stderr_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+    } else {
+        tokio::spawn(async {})
+    };
+
+    // Collect lines from both streams as they arrive, enforcing the cap
     let mut output = String::new();
     let mut truncated = false;
 
-    // Stream stdout
-    if let Some(stdout) = child.stdout.take() {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if output.len() + line.len() > MAX_OUTPUT_CHARS {
-                truncated = true;
+    // Wait for both drain tasks to finish (they close the channel when done)
+    let collect_task = tokio::spawn(async move {
+        let mut out = String::new();
+        let mut trunc = false;
+        while let Some(line) = rx.recv().await {
+            if out.len() + line.len() + 1 > MAX_OUTPUT_CHARS {
+                trunc = true;
+                // Keep draining the channel so the tasks don't block on send
+                while rx.recv().await.is_some() {}
                 break;
             }
-            output.push_str(&line);
-            output.push('\n');
+            out.push_str(&line);
+            out.push('\n');
         }
-    }
+        (out, trunc)
+    });
 
-    // Stream stderr
-    if let Some(stderr) = child.stderr.take() {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if output.len() + line.len() > MAX_OUTPUT_CHARS {
-                truncated = true;
-                break;
-            }
-            output.push_str(&line);
-            output.push('\n');
-        }
+    // Drive all three tasks concurrently
+    let (_, _, collected) = tokio::join!(stdout_task, stderr_task, collect_task);
+    if let Ok((out, trunc)) = collected {
+        output = out;
+        truncated = trunc;
     }
 
     let status = child.wait().await;

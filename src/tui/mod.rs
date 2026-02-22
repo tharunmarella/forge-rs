@@ -368,6 +368,7 @@ async fn send_message(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &m
     };
     
     app.is_thinking = false;
+    let response = strip_thinking(&response);
     if let Some(msg) = app.messages.last_mut() { msg.content = response.clone(); }
     app.agent.messages.push(Message { role: Role::Assistant, content: response, tool_calls: None, tool_results: None });
     
@@ -492,4 +493,31 @@ fn draw_approval_dialog(f: &mut Frame, pending: &PendingApproval, area: Rect) {
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new((area.width - width) / 2, (area.height - height) / 2, width, height)
+}
+
+/// Strip thinking/reasoning blocks that thinking models (Qwen3, etc.) emit.
+/// Handles both <think>...</think> and bare ...content...</think> (no opening tag).
+fn strip_thinking(text: &str) -> String {
+    // If </think> exists, everything before the last </think> is reasoning — discard it
+    if let Some(end) = text.rfind("</think>") {
+        return text[end + "</think>".len()..].trim().to_string();
+    }
+    // No closing tag — strip <think>...</think> blocks if present
+    let mut result = String::new();
+    let mut remaining = text;
+    loop {
+        match remaining.find("<think>") {
+            None => { result.push_str(remaining); break; }
+            Some(start) => {
+                result.push_str(&remaining[..start]);
+                match remaining[start..].find("</think>") {
+                    None => break,
+                    Some(rel_end) => {
+                        remaining = &remaining[start + rel_end + "</think>".len()..];
+                    }
+                }
+            }
+        }
+    }
+    result.trim().to_string()
 }

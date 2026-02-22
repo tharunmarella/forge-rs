@@ -88,22 +88,35 @@ impl Tool for ForgeToolAdapter {
                 let desc = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
                 
                 let new_step = PlanStep {
-                    number: (after + 1) as i32,
+                    number: 0, // will be renumbered below
                     description: desc.to_string(),
                     status: "pending".to_string(),
                 };
                 
-                if after >= state.plan.len() {
-                    state.plan.push(new_step);
-                } else {
-                    state.plan.insert(after, new_step);
-                }
+                // Insert AFTER the given step index (after=0 means prepend)
+                let insert_at = after.min(state.plan.len());
+                state.plan.insert(insert_at, new_step);
                 
-                // Renumber
+                // Renumber all steps sequentially
                 for (i, step) in state.plan.iter_mut().enumerate() {
                     step.number = (i + 1) as i32;
                 }
-                return Ok(format!("Added new step at position {}.", after + 1));
+                return Ok(format!("Added new step at position {}.", insert_at + 1));
+            }
+            "remove_plan_step" => {
+                let mut state = self.state.lock().unwrap();
+                let step_num = args.get("step_number").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let before_len = state.plan.len();
+                state.plan.retain(|s| s.number != step_num);
+                // Renumber remaining steps
+                for (i, step) in state.plan.iter_mut().enumerate() {
+                    step.number = (i + 1) as i32;
+                }
+                if state.plan.len() < before_len {
+                    return Ok(format!("Removed step {}. Plan now has {} steps.", step_num, state.plan.len()));
+                } else {
+                    return Ok(format!("Step {} not found in plan.", step_num));
+                }
             }
             "discard_plan" => {
                 let mut state = self.state.lock().unwrap();

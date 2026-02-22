@@ -103,10 +103,10 @@ pub async fn files(args: &Value, workdir: &Path) -> ToolResult {
             continue;
         }
 
-        // Read and search
-        if let Ok(content) = std::fs::read_to_string(file_path) {
+        // Read and search — use async I/O to avoid blocking the executor.
+        if let Ok(content) = tokio::fs::read_to_string(file_path).await {
             let rel_path = file_path.strip_prefix(workdir).unwrap_or(file_path);
-            
+
             for (line_num, line) in content.lines().enumerate() {
                 if regex.is_match(line) {
                     results.push(format!(
@@ -116,7 +116,7 @@ pub async fn files(args: &Value, workdir: &Path) -> ToolResult {
                         line.trim()
                     ));
                     match_count += 1;
-                    
+
                     if match_count >= MAX_MATCHES {
                         results.push(format!("... (truncated at {} matches)", MAX_MATCHES));
                         return ToolResult::ok(results.join("\n"));
@@ -146,24 +146,18 @@ pub async fn semantic(args: &Value, workdir: &Path) -> ToolResult {
         .and_then(|g| g.clone())
         .unwrap_or(EmbeddingProvider::None);
     
-    // Try to use persistent embedding database
-    let _db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+    // Open the persistent embedding database once and reuse it.
+    // A second open() call is unnecessary and wastes I/O.
+    let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!("Failed to open embedding database: {}", e);
             return keyword_search(query, workdir).await;
         }
     };
-    
+
     // Check if we need to index (first time or few chunks)
-    let chunk_count = {
-        let db = super::embeddings_store::EmbeddingDb::open(workdir, provider.clone());
-        if let Ok(db) = db {
-            db.chunk_count().await
-        } else {
-            0
-        }
-    };
+    let chunk_count = db.chunk_count().await;
 
     if chunk_count < 10 {
         tracing::info!("Embedding database has {} chunks, indexing workspace...", chunk_count);
@@ -276,32 +270,44 @@ fn is_code_file(name: &str) -> bool {
 
 /// Fallback keyword search
 async fn keyword_search(query: &str, workdir: &Path) -> ToolResult {
-    let keywords: Vec<&str> = query.split_whitespace().collect();
-    let mut results = Vec::new();
-    
-    for entry in WalkDir::new(workdir)
+    let keywords: Vec<String> = query
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    // Collect candidate paths without blocking the executor on file I/O.
+    // WalkDir itself is synchronous but cheap (just directory metadata); the
+    // expensive part is reading file contents, which we do with tokio::fs.
+    let entries: Vec<_> = WalkDir::new(workdir)
         .max_depth(5)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-    {
-        let file_path = entry.path();
-        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        
-        if file_name.starts_with('.') || is_binary_extension(file_name) {
-            continue;
-        }
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.') && !is_binary_extension(&name)
+        })
+        .collect();
 
-        if let Ok(content) = std::fs::read_to_string(file_path) {
+    let mut results = Vec::new();
+
+    for entry in entries {
+        let file_path = entry.path().to_path_buf();
+        // Use async file I/O so we don't block the Tokio thread pool.
+        if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
             let content_lower = content.to_lowercase();
             let match_count = keywords
                 .iter()
-                .filter(|kw| content_lower.contains(&kw.to_lowercase()))
+                .filter(|kw| content_lower.contains(kw.as_str()))
                 .count();
-            
+
             if match_count > 0 {
-                let rel_path = file_path.strip_prefix(workdir).unwrap_or(file_path);
-                results.push((match_count, rel_path.display().to_string(), content.clone()));
+                let rel_path = file_path
+                    .strip_prefix(workdir)
+                    .unwrap_or(&file_path)
+                    .display()
+                    .to_string();
+                results.push((match_count, rel_path, content));
             }
         }
     }
@@ -360,44 +366,42 @@ pub async fn grep(args: &Value, workdir: &Path) -> ToolResult {
     let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'pattern' parameter");
     };
-    
+
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let file_glob = args.get("glob").and_then(|v| v.as_str());
     let case_insensitive = args.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false);
     let context_lines = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    
+
     let search_path = workdir.join(path);
-    
-    // Build ripgrep command
-    let mut cmd = std::process::Command::new("rg");
+
+    // Build ripgrep command using tokio's async Command so we don't block the executor.
+    let mut cmd = tokio::process::Command::new("rg");
     cmd.arg("--line-number")
         .arg("--no-heading")
         .arg("--color=never")
-        .arg("--max-count=100");  // Limit matches
-    
+        .arg("--max-count=100"); // Limit matches
+
     if case_insensitive {
         cmd.arg("-i");
     }
-    
+
     if context_lines > 0 {
         cmd.arg(format!("-C{}", context_lines.min(5)));
     }
-    
+
     if let Some(glob) = file_glob {
         cmd.arg("-g").arg(glob);
     }
-    
+
     // Exclude common directories
     cmd.arg("--glob=!node_modules")
         .arg("--glob=!target")
         .arg("--glob=!.git")
         .arg("--glob=!*.lock");
-    
-    cmd.arg(pattern)
-        .arg(&search_path)
-        .current_dir(workdir);
-    
-    match cmd.output() {
+
+    cmd.arg(pattern).arg(&search_path).current_dir(workdir);
+
+    match cmd.output().await {
         Ok(output) => {
             if output.status.success() || output.status.code() == Some(1) {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -405,11 +409,12 @@ pub async fn grep(args: &Value, workdir: &Path) -> ToolResult {
                     ToolResult::ok("No matches found")
                 } else {
                     // Make paths relative
+                    let search_path_str = search_path.to_string_lossy().to_string();
                     let result = stdout
                         .lines()
                         .take(200)
                         .map(|line| {
-                            if let Some(rel) = line.strip_prefix(&search_path.to_string_lossy().to_string()) {
+                            if let Some(rel) = line.strip_prefix(&search_path_str) {
                                 rel.trim_start_matches('/').to_string()
                             } else {
                                 line.to_string()

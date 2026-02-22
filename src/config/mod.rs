@@ -114,11 +114,14 @@ fn default_groq_models() -> Vec<String> {
 
 fn default_mlx_models() -> Vec<String> {
     vec![
-        "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit".into(),
+        "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit-dwq-v2".into(),
+        "mlx-community/Qwen3-Coder-30B-A3B-Instruct-6bit-DWQ-lr3e-7".into(),
+        "mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit".into(),
+        "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit".into(),
+        "mlx-community/IQuest-Coder-V1-40B-Loop-Instruct-4bit".into(),
+        "mlx-community/Qwen2.5-Coder-14B-Instruct-8bit".into(),
         "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
-        "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit".into(),
-        "mlx-community/Qwen3-Coder-Next-4bit".into(),
-        "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit".into(),
+        "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit".into(),
     ]
 }
 

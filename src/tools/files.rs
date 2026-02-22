@@ -509,7 +509,15 @@ fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String> {
         }
     }
 
-    Ok(lines.join("\n"))
+    // Preserve the trailing newline that was present in the original file.
+    // `str::lines()` strips the final newline, so `join("\n")` would silently
+    // drop it.  We re-add it only when the original ended with a newline so we
+    // don't introduce one where there wasn't one.
+    let mut result = lines.join("\n");
+    if original.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
 }
 
 /// Apply a V4A format patch (used by apply_patch tool)

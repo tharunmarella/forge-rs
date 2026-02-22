@@ -9,93 +9,95 @@
 use super::ToolResult;
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 
 /// Diagnostics tool - callable by the LLM to check code for errors
 pub async fn diagnostics(args: &Value, workdir: &Path) -> ToolResult {
     let Some(path_str) = args.get("path").and_then(|v| v.as_str()) else {
         return ToolResult::err("Missing 'path' parameter");
     };
-    
+
     let auto_fix = args.get("fix").and_then(|v| v.as_bool()).unwrap_or(false);
     let target_path = workdir.join(path_str);
-    
+
     if !target_path.exists() {
         return ToolResult::err(format!("Path does not exist: {}", path_str));
     }
-    
+
     // Determine if this is a file or directory
     let result = if target_path.is_dir() {
-        run_project_diagnostics(&target_path, auto_fix)
+        run_project_diagnostics(&target_path, auto_fix).await
     } else {
-        lint_file(&target_path, workdir)
+        lint_file(&target_path, workdir).await
     };
-    
+
     if result.success {
         ToolResult::ok(format!("No errors found in {}", path_str))
     } else if result.errors.is_empty() {
-        // Raw output but no parsed errors
+        // Raw output but no parsed errors — linter crashed or produced unparseable output
         ToolResult::err(format!("Diagnostics failed:\n{}", result.raw_output))
     } else {
         let mut output = format!("Found {} error(s) in {}:\n\n", result.errors.len(), path_str);
-        
+
         for err in &result.errors {
             let location = match (err.line, err.column) {
                 (Some(l), Some(c)) => format!("{}:{}:{}", err.file, l, c),
                 (Some(l), None) => format!("{}:{}", err.file, l),
                 _ => err.file.clone(),
             };
-            
+
             let severity_icon = match err.severity {
                 LintSeverity::Error => "❌",
                 LintSeverity::Warning => "⚠️",
                 LintSeverity::Info => "ℹ️",
             };
-            
+
             output.push_str(&format!("{} {} {}\n", severity_icon, location, err.message));
         }
-        
+
         ToolResult::err(output)
     }
 }
 
 /// Run project-level diagnostics (for directories)
-fn run_project_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
+async fn run_project_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
     // Check for Cargo.toml (Rust project)
     if dir.join("Cargo.toml").exists() {
-        return run_cargo_diagnostics(dir, auto_fix);
+        return run_cargo_diagnostics(dir, auto_fix).await;
     }
-    
+
     // Check for package.json (Node.js/TypeScript project)
     if dir.join("package.json").exists() {
-        return run_npm_diagnostics(dir, auto_fix);
+        return run_npm_diagnostics(dir, auto_fix).await;
     }
-    
+
     // Check for go.mod (Go project)
     if dir.join("go.mod").exists() {
-        return run_go_diagnostics(dir, auto_fix);
+        return run_go_diagnostics(dir, auto_fix).await;
     }
-    
+
     // Check for pyproject.toml or setup.py (Python project)
     if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() {
-        return run_python_diagnostics(dir, auto_fix);
+        return run_python_diagnostics(dir, auto_fix).await;
     }
-    
+
     LintResult::ok() // No recognized project type
 }
 
 /// Run cargo check for Rust projects
-fn run_cargo_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
-    let mut args = vec!["check", "--message-format=short"];
-    if auto_fix {
-        args = vec!["fix", "--allow-dirty", "--allow-staged"];
-    }
-    
+async fn run_cargo_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
+    let args: &[&str] = if auto_fix {
+        &["fix", "--allow-dirty", "--allow-staged"]
+    } else {
+        &["check", "--message-format=short"]
+    };
+
     let output = Command::new("cargo")
-        .args(&args)
+        .args(args)
         .current_dir(dir)
-        .output();
-    
+        .output()
+        .await;
+
     match output {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -110,45 +112,80 @@ fn run_cargo_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
     }
 }
 
-/// Parse cargo check output
+/// Parse cargo check output.
+///
+/// Cargo's `--message-format=short` emits lines like:
+///   src/main.rs:10:5: error[E0308]: mismatched types
+///
+/// On Windows the path starts with a drive letter, e.g. `C:\src\main.rs:10:5: …`.
+/// A naïve `splitn(4, ':')` would split `C:\src\main.rs` into `["C", "\\src\\main.rs", …]`
+/// and lose the file path.  We handle this by detecting a single-character first
+/// segment (the drive letter) and re-joining it with the next segment.
 fn parse_cargo_errors(output: &str) -> Vec<LintError> {
     let mut errors = Vec::new();
-    
+
     for line in output.lines() {
-        // Format: file:line:col: level: message
-        if line.contains(": error") || line.contains(": warning") {
-            let severity = if line.contains(": error") {
-                LintSeverity::Error
-            } else {
-                LintSeverity::Warning
-            };
-            
-            // Try to parse location
-            let parts: Vec<&str> = line.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                errors.push(LintError {
-                    file: parts[0].trim().to_string(),
-                    line: parts.get(1).and_then(|s| s.trim().parse().ok()),
-                    column: parts.get(2).and_then(|s| s.trim().parse().ok()),
-                    message: parts.get(3).map(|s| s.trim().to_string()).unwrap_or_default(),
-                    severity,
-                });
-            }
+        // Only process lines that look like diagnostics
+        if !line.contains(": error") && !line.contains(": warning") {
+            continue;
         }
+
+        let severity = if line.contains(": error") {
+            LintSeverity::Error
+        } else {
+            LintSeverity::Warning
+        };
+
+        // Split into at most 5 parts so a Windows drive letter can be re-joined.
+        let raw_parts: Vec<&str> = line.splitn(5, ':').collect();
+
+        // Re-join drive letter on Windows: ["C", "\\path\\file.rs", "10", "5", " error: …"]
+        let (file, line_num, col, message) = if raw_parts.len() >= 5
+            && raw_parts[0].len() == 1
+            && raw_parts[0].chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+        {
+            // Windows path
+            let file = format!("{}:{}", raw_parts[0], raw_parts[1]);
+            (
+                file,
+                raw_parts.get(2).and_then(|s| s.trim().parse().ok()),
+                raw_parts.get(3).and_then(|s| s.trim().parse().ok()),
+                raw_parts.get(4).map(|s| s.trim().to_string()).unwrap_or_default(),
+            )
+        } else if raw_parts.len() >= 4 {
+            // Unix path
+            (
+                raw_parts[0].trim().to_string(),
+                raw_parts.get(1).and_then(|s| s.trim().parse().ok()),
+                raw_parts.get(2).and_then(|s| s.trim().parse().ok()),
+                raw_parts.get(3).map(|s| s.trim().to_string()).unwrap_or_default(),
+            )
+        } else {
+            continue;
+        };
+
+        errors.push(LintError {
+            file,
+            line: line_num,
+            column: col,
+            message,
+            severity,
+        });
     }
-    
+
     errors
 }
 
 /// Run npm/tsc for Node.js projects
-fn run_npm_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
+async fn run_npm_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
     // Try tsc first for TypeScript
     if dir.join("tsconfig.json").exists() {
         let output = Command::new("npx")
             .args(["tsc", "--noEmit", "--pretty", "false"])
             .current_dir(dir)
-            .output();
-        
+            .output()
+            .await;
+
         if let Ok(out) = output {
             if !out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -157,18 +194,19 @@ fn run_npm_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
             }
         }
     }
-    
+
     // Try eslint
     let mut eslint_args = vec!["eslint", ".", "--format=compact"];
     if auto_fix {
         eslint_args.push("--fix");
     }
-    
+
     let output = Command::new("npx")
         .args(&eslint_args)
         .current_dir(dir)
-        .output();
-    
+        .output()
+        .await;
+
     match output {
         Ok(out) => {
             if out.status.success() {
@@ -186,49 +224,57 @@ fn run_npm_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
 /// Parse tsc output for projects
 fn parse_tsc_project_errors(output: &str) -> Vec<LintError> {
     let mut errors = Vec::new();
-    
+
     for line in output.lines() {
         // Format: file(line,col): error TSxxxx: message
         if line.contains("): error TS") || line.contains("): warning TS") {
             if let Some(paren_start) = line.find('(') {
                 let file = line[..paren_start].trim().to_string();
-                
+
                 if let Some(paren_end) = line.find("): ") {
                     let location = &line[paren_start + 1..paren_end];
                     let loc_parts: Vec<&str> = location.split(',').collect();
                     let message = &line[paren_end + 3..];
-                    
+
                     errors.push(LintError {
                         file,
-                        line: loc_parts.get(0).and_then(|s| s.parse().ok()),
+                        line: loc_parts.first().and_then(|s| s.parse().ok()),
                         column: loc_parts.get(1).and_then(|s| s.parse().ok()),
                         message: message.to_string(),
-                        severity: if line.contains("error TS") { LintSeverity::Error } else { LintSeverity::Warning },
+                        severity: if line.contains("error TS") {
+                            LintSeverity::Error
+                        } else {
+                            LintSeverity::Warning
+                        },
                     });
                 }
             }
         }
     }
-    
+
     errors
 }
 
 /// Parse eslint compact output for projects
 fn parse_eslint_project_errors(output: &str) -> Vec<LintError> {
     let mut errors = Vec::new();
-    
+
     for line in output.lines() {
         // Format: file: line X, col Y, Error/Warning - message
         if let Some(colon_pos) = line.find(": line ") {
             let file = line[..colon_pos].trim().to_string();
             let rest = &line[colon_pos + 7..];
-            
+
             // Parse "X, col Y, Error - message"
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if let Some(line_num) = parts.get(0).and_then(|s| s.trim().parse::<usize>().ok()) {
-                let severity = if rest.contains("Error") { LintSeverity::Error } else { LintSeverity::Warning };
+            if let Some(line_num) = parts.first().and_then(|s| s.trim().parse::<usize>().ok()) {
+                let severity = if rest.contains("Error") {
+                    LintSeverity::Error
+                } else {
+                    LintSeverity::Warning
+                };
                 let message = parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
-                
+
                 errors.push(LintError {
                     file,
                     line: Some(line_num),
@@ -239,18 +285,19 @@ fn parse_eslint_project_errors(output: &str) -> Vec<LintError> {
             }
         }
     }
-    
+
     errors
 }
 
 /// Run go vet/build for Go projects
-fn run_go_diagnostics(dir: &Path, _auto_fix: bool) -> LintResult {
+async fn run_go_diagnostics(dir: &Path, _auto_fix: bool) -> LintResult {
     // Run go vet
     let output = Command::new("go")
         .args(["vet", "./..."])
         .current_dir(dir)
-        .output();
-    
+        .output()
+        .await;
+
     match output {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -259,8 +306,9 @@ fn run_go_diagnostics(dir: &Path, _auto_fix: bool) -> LintResult {
                 let build_output = Command::new("go")
                     .args(["build", "./..."])
                     .current_dir(dir)
-                    .output();
-                
+                    .output()
+                    .await;
+
                 match build_output {
                     Ok(bout) => {
                         if bout.status.success() {
@@ -285,7 +333,7 @@ fn run_go_diagnostics(dir: &Path, _auto_fix: bool) -> LintResult {
 /// Parse go errors
 fn parse_go_project_errors(output: &str) -> Vec<LintError> {
     let mut errors = Vec::new();
-    
+
     for line in output.lines() {
         // Format: file.go:line:col: message
         if line.contains(".go:") {
@@ -301,23 +349,24 @@ fn parse_go_project_errors(output: &str) -> Vec<LintError> {
             }
         }
     }
-    
+
     errors
 }
 
 /// Run python linters
-fn run_python_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
+async fn run_python_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
     // Try ruff first
     let mut ruff_args = vec!["check", "."];
     if auto_fix {
         ruff_args.push("--fix");
     }
-    
+
     let output = Command::new("ruff")
         .args(&ruff_args)
         .current_dir(dir)
-        .output();
-    
+        .output()
+        .await;
+
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -333,8 +382,9 @@ fn run_python_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
             let mypy_output = Command::new("mypy")
                 .args([".", "--no-error-summary"])
                 .current_dir(dir)
-                .output();
-            
+                .output()
+                .await;
+
             match mypy_output {
                 Ok(out) => {
                     if out.status.success() {
@@ -353,7 +403,7 @@ fn run_python_diagnostics(dir: &Path, auto_fix: bool) -> LintResult {
 /// Parse ruff output
 fn parse_ruff_errors(output: &str) -> Vec<LintError> {
     let mut errors = Vec::new();
-    
+
     for line in output.lines() {
         // Format: file:line:col: CODE message
         let parts: Vec<&str> = line.splitn(4, ':').collect();
@@ -367,7 +417,7 @@ fn parse_ruff_errors(output: &str) -> Vec<LintError> {
             });
         }
     }
-    
+
     errors
 }
 
@@ -413,27 +463,39 @@ impl LintResult {
         }
     }
 
-    /// Format errors for LLM consumption
+    /// Format errors for LLM consumption.
+    ///
+    /// When `!success` but `errors` is empty the linter crashed or produced
+    /// output we couldn't parse.  Return the raw output so the LLM sees the
+    /// actual failure instead of a misleading "Found 0 lint error(s)" message.
     pub fn format_for_llm(&self) -> String {
         if self.success {
             return "No lint errors.".to_string();
         }
 
+        if self.errors.is_empty() {
+            // Linter failed but we have no structured errors — surface raw output
+            return format!(
+                "Linter failed with no parseable errors. Raw output:\n{}",
+                self.raw_output
+            );
+        }
+
         let mut output = format!("Found {} lint error(s):\n\n", self.errors.len());
-        
+
         for err in &self.errors {
             let location = match (err.line, err.column) {
                 (Some(l), Some(c)) => format!("{}:{}:{}", err.file, l, c),
                 (Some(l), None) => format!("{}:{}", err.file, l),
                 _ => err.file.clone(),
             };
-            
+
             let severity = match err.severity {
                 LintSeverity::Error => "ERROR",
                 LintSeverity::Warning => "WARNING",
                 LintSeverity::Info => "INFO",
             };
-            
+
             output.push_str(&format!("{}: [{}] {}\n", location, severity, err.message));
         }
 
@@ -442,53 +504,56 @@ impl LintResult {
 }
 
 /// Run appropriate linter based on file extension
-pub fn lint_file(file_path: &Path, workdir: &Path) -> LintResult {
+pub async fn lint_file(file_path: &Path, workdir: &Path) -> LintResult {
     let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    
+
     match extension {
-        "rs" => lint_rust(file_path, workdir),
-        "py" => lint_python(file_path, workdir),
-        "js" | "jsx" => lint_javascript(file_path, workdir),
-        "ts" | "tsx" => lint_typescript(file_path, workdir),
-        "go" => lint_go(file_path, workdir),
+        "rs" => lint_rust(file_path, workdir).await,
+        "py" => lint_python(file_path, workdir).await,
+        "js" | "jsx" => lint_javascript(file_path, workdir).await,
+        "ts" | "tsx" => lint_typescript(file_path, workdir).await,
+        "go" => lint_go(file_path, workdir).await,
         _ => LintResult::ok(), // No linter available, assume ok
     }
 }
 
-/// Lint Rust files with rustc
-fn lint_rust(file_path: &Path, workdir: &Path) -> LintResult {
+/// Lint Rust files with rustc / cargo check
+async fn lint_rust(file_path: &Path, workdir: &Path) -> LintResult {
     // Check if this file is in a cargo project
     let file_dir = file_path.parent().unwrap_or(workdir);
     let cargo_toml = file_dir.join("Cargo.toml");
-    
+
     // Also check workdir for cargo project (file might be in src/)
     let workdir_cargo = workdir.join("Cargo.toml");
     let file_in_workdir = file_path.starts_with(workdir);
-    
+
     let output = if file_in_workdir && workdir_cargo.exists() {
         // File is part of the workspace cargo project
         Command::new("cargo")
             .args(["check", "--message-format=short"])
             .current_dir(workdir)
             .output()
+            .await
     } else if cargo_toml.exists() {
         // File has its own cargo project
         Command::new("cargo")
             .args(["check", "--message-format=short"])
             .current_dir(file_dir)
             .output()
+            .await
     } else {
         // Standalone file - use rustc
         Command::new("rustc")
             .args(["--error-format=short", "--emit=metadata", "-o", "/dev/null"])
             .arg(file_path)
             .output()
+            .await
     };
 
     match output {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            
+
             if out.status.success() || stderr.trim().is_empty() {
                 return LintResult::ok();
             }
@@ -504,7 +569,7 @@ fn lint_rust(file_path: &Path, workdir: &Path) -> LintResult {
 fn parse_rust_errors(output: &str, file_path: &Path) -> Vec<LintError> {
     let mut errors = Vec::new();
     let file_name = file_path.to_string_lossy();
-    
+
     for line in output.lines() {
         // Format: file:line:col: level: message
         if line.contains(": error") || line.contains(": warning") {
@@ -515,7 +580,7 @@ fn parse_rust_errors(output: &str, file_path: &Path) -> Vec<LintError> {
                 } else {
                     LintSeverity::Warning
                 };
-                
+
                 errors.push(LintError {
                     file: file_name.to_string(),
                     line: parts.get(1).and_then(|s| s.trim().parse().ok()),
@@ -526,18 +591,19 @@ fn parse_rust_errors(output: &str, file_path: &Path) -> Vec<LintError> {
             }
         }
     }
-    
+
     errors
 }
 
 /// Lint Python files
-fn lint_python(file_path: &Path, workdir: &Path) -> LintResult {
+async fn lint_python(file_path: &Path, workdir: &Path) -> LintResult {
     // Try ruff first (faster, more modern)
     let ruff_result = Command::new("ruff")
         .args(["check", "--output-format=text"])
         .arg(file_path)
         .current_dir(workdir)
-        .output();
+        .output()
+        .await;
 
     if let Ok(out) = ruff_result {
         let output = String::from_utf8_lossy(&out.stdout);
@@ -552,7 +618,8 @@ fn lint_python(file_path: &Path, workdir: &Path) -> LintResult {
         .args(["-m", "py_compile"])
         .arg(file_path)
         .current_dir(workdir)
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(out) => {
@@ -581,7 +648,10 @@ fn parse_python_errors(output: &str, file_path: &Path) -> Vec<LintError> {
                     file: file_name.to_string(),
                     line: parts.get(1).and_then(|s| s.trim().parse().ok()),
                     column: parts.get(2).and_then(|s| s.trim().parse().ok()),
-                    message: parts.get(3).map(|s| s.trim().to_string()).unwrap_or(line.to_string()),
+                    message: parts
+                        .get(3)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or(line.to_string()),
                     severity: LintSeverity::Error,
                 });
             }
@@ -603,12 +673,13 @@ fn parse_python_errors(output: &str, file_path: &Path) -> Vec<LintError> {
 }
 
 /// Lint JavaScript files
-fn lint_javascript(file_path: &Path, workdir: &Path) -> LintResult {
+async fn lint_javascript(file_path: &Path, workdir: &Path) -> LintResult {
     let output = Command::new("eslint")
         .args(["--format=compact", "--no-color"])
         .arg(file_path)
         .current_dir(workdir)
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(out) => {
@@ -624,24 +695,25 @@ fn lint_javascript(file_path: &Path, workdir: &Path) -> LintResult {
 }
 
 /// Lint TypeScript files
-fn lint_typescript(file_path: &Path, workdir: &Path) -> LintResult {
+async fn lint_typescript(file_path: &Path, workdir: &Path) -> LintResult {
     // Try tsc --noEmit first
     let output = Command::new("tsc")
         .args(["--noEmit", "--pretty", "false"])
         .arg(file_path)
         .current_dir(workdir)
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(out) => {
             if out.status.success() {
                 // Also try eslint
-                return lint_javascript(file_path, workdir);
+                return lint_javascript(file_path, workdir).await;
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
             LintResult::failed(parse_tsc_errors(&stdout, file_path), stdout.to_string())
         }
-        Err(_) => lint_javascript(file_path, workdir), // Fall back to eslint
+        Err(_) => lint_javascript(file_path, workdir).await, // Fall back to eslint
     }
 }
 
@@ -656,16 +728,22 @@ fn parse_eslint_errors(output: &str, file_path: &Path) -> Vec<LintError> {
             if let Some(msg_start) = line.find(": line ") {
                 let after = &line[msg_start + 7..];
                 let parts: Vec<&str> = after.splitn(3, ' ').collect();
-                
-                let location = parts.get(0).unwrap_or(&"");
+
+                let location = parts.first().unwrap_or(&"");
                 let loc_parts: Vec<&str> = location.split(',').collect();
-                
+
                 errors.push(LintError {
                     file: file_name.to_string(),
-                    line: loc_parts.get(0).and_then(|s| s.trim().parse().ok()),
-                    column: loc_parts.get(1).and_then(|s| s.trim().trim_end_matches(',').parse().ok()),
+                    line: loc_parts.first().and_then(|s| s.trim().parse().ok()),
+                    column: loc_parts
+                        .get(1)
+                        .and_then(|s| s.trim().trim_end_matches(',').parse().ok()),
                     message: parts.get(2..).map(|s| s.join(" ")).unwrap_or_default(),
-                    severity: if line.contains("Error") { LintSeverity::Error } else { LintSeverity::Warning },
+                    severity: if line.contains("Error") {
+                        LintSeverity::Error
+                    } else {
+                        LintSeverity::Warning
+                    },
                 });
             }
         }
@@ -687,13 +765,17 @@ fn parse_tsc_errors(output: &str, file_path: &Path) -> Vec<LintError> {
                     let location = &line[paren_start + 1..paren_end];
                     let loc_parts: Vec<&str> = location.split(',').collect();
                     let message = &line[paren_end + 3..];
-                    
+
                     errors.push(LintError {
                         file: file_name.to_string(),
-                        line: loc_parts.get(0).and_then(|s| s.parse().ok()),
+                        line: loc_parts.first().and_then(|s| s.parse().ok()),
                         column: loc_parts.get(1).and_then(|s| s.parse().ok()),
                         message: message.to_string(),
-                        severity: if line.contains("error TS") { LintSeverity::Error } else { LintSeverity::Warning },
+                        severity: if line.contains("error TS") {
+                            LintSeverity::Error
+                        } else {
+                            LintSeverity::Warning
+                        },
                     });
                 }
             }
@@ -704,12 +786,13 @@ fn parse_tsc_errors(output: &str, file_path: &Path) -> Vec<LintError> {
 }
 
 /// Lint Go files
-fn lint_go(file_path: &Path, workdir: &Path) -> LintResult {
+async fn lint_go(file_path: &Path, workdir: &Path) -> LintResult {
     let output = Command::new("go")
         .args(["vet"])
         .arg(file_path)
         .current_dir(workdir)
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(out) => {
@@ -738,7 +821,10 @@ fn parse_go_errors(output: &str, file_path: &Path) -> Vec<LintError> {
                     file: file_name.to_string(),
                     line: parts.get(1).and_then(|s| s.trim().parse().ok()),
                     column: parts.get(2).and_then(|s| s.trim().parse().ok()),
-                    message: parts.get(3..).map(|s| s.join(":").trim().to_string()).unwrap_or_default(),
+                    message: parts
+                        .get(3..)
+                        .map(|s| s.join(":").trim().to_string())
+                        .unwrap_or_default(),
                     severity: LintSeverity::Error,
                 });
             }
@@ -754,24 +840,24 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_lint_valid_rust() {
+    #[tokio::test]
+    async fn test_lint_valid_rust() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.rs");
         fs::write(&file_path, "fn main() { println!(\"Hello\"); }").unwrap();
-        
-        let result = lint_rust(&file_path, dir.path());
+
+        let result = lint_rust(&file_path, dir.path()).await;
         // May fail if rustc not available, that's ok
         println!("Lint result: {:?}", result);
     }
 
-    #[test]
-    fn test_lint_invalid_rust() {
+    #[tokio::test]
+    async fn test_lint_invalid_rust() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.rs");
         fs::write(&file_path, "fn main() { let x: i32 = \"not an int\"; }").unwrap();
-        
-        let result = lint_rust(&file_path, dir.path());
+
+        let result = lint_rust(&file_path, dir.path()).await;
         println!("Lint result: {:?}", result);
         // Should have errors if rustc is available
     }
@@ -779,21 +865,37 @@ mod tests {
     #[test]
     fn test_format_for_llm() {
         let result = LintResult::failed(
-            vec![
-                LintError {
-                    file: "test.rs".to_string(),
-                    line: Some(10),
-                    column: Some(5),
-                    message: "mismatched types".to_string(),
-                    severity: LintSeverity::Error,
-                },
-            ],
+            vec![LintError {
+                file: "test.rs".to_string(),
+                line: Some(10),
+                column: Some(5),
+                message: "mismatched types".to_string(),
+                severity: LintSeverity::Error,
+            }],
             "raw output".to_string(),
         );
-        
+
         let formatted = result.format_for_llm();
         assert!(formatted.contains("test.rs:10:5"));
         assert!(formatted.contains("ERROR"));
         assert!(formatted.contains("mismatched types"));
+    }
+
+    #[test]
+    fn test_format_for_llm_empty_errors() {
+        // When linter fails but produces no parseable errors, should show raw output
+        let result = LintResult::failed(vec![], "cargo: command not found".to_string());
+        let formatted = result.format_for_llm();
+        assert!(formatted.contains("cargo: command not found"));
+        assert!(!formatted.contains("Found 0 lint error(s)"));
+    }
+
+    #[test]
+    fn test_parse_cargo_errors_windows_path() {
+        let output = "C:\\src\\main.rs:10:5: error[E0308]: mismatched types";
+        let errors = parse_cargo_errors(output);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file, "C:\\src\\main.rs");
+        assert_eq!(errors[0].line, Some(10));
     }
 }
