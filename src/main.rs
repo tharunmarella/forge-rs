@@ -19,15 +19,16 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "forge", version, about = "Terminal-first AI coding agent")]
 struct Cli {
+    /// Initial prompt to send
+    #[arg(index = 1)]
+    prompt: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Initial prompt to send
-    prompt: Option<String>,
-
     /// Model to use (e.g., gemini-2.5-flash, claude-sonnet-4, gpt-4o)
-    #[arg(short, long, default_value = "gemini-2.5-flash")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 
     /// API provider (gemini, anthropic, openai)
     #[arg(short, long)]
@@ -175,17 +176,16 @@ async fn main() -> Result<()> {
         cfg.provider = provider;
     }
     
-    // Only override model if explicitly provided AND different from default
-    // Don't override auto-detected MLX models with CLI defaults
-    if cli.model != "gemini-2.5-flash" {
-        cfg.model = cli.model;
+    // Only override model if explicitly provided
+    if let Some(model) = cli.model {
+        cfg.model = model;
     } else if cfg.provider == "mlx" && cfg.model.starts_with("mlx-community/") {
         // Keep the auto-detected MLX model
     } else if cfg.provider != "mlx" {
         // For non-MLX providers, use CLI default if no config model set
         if cfg.model.starts_with("mlx-community/") {
-            // Config has MLX model but we're not using MLX provider
-            cfg.model = cli.model;
+            // Fallback if provider changed from MLX
+            cfg.model = "gemini-2.5-flash".to_string();
         }
     }
     
@@ -304,6 +304,9 @@ async fn handle_command(cmd: Commands, workdir: &std::path::Path) -> Result<()> 
                         }
                         "model" => {
                             cfg.model = value.to_string();
+                        }
+                        "local-server-url" => {
+                            cfg.local_server_url = Some(value.to_string());
                         }
                         _ => {
                             println!("Unknown setting: {}", key);

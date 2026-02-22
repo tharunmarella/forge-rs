@@ -11,11 +11,19 @@ pub mod mlx_native;
 pub mod mlx_client;
 
 pub fn create_openai_agent_builder(config: &Config) -> Result<AgentBuilder<openai::responses_api::ResponsesCompletionModel>> {
-    let client = if let Some(key) = &config.openai_api_key {
+    let api_key = config.api_key().unwrap_or("local");
+    
+    let client: openai::Client = if let Some(url) = &config.base_url {
+        openai::Client::builder()
+            .api_key(api_key)
+            .base_url(url)
+            .build()?
+    } else if let Some(key) = &config.openai_api_key {
         openai::Client::new(key)?
     } else {
         openai::Client::from_env()
     };
+    
     Ok(client.agent(&config.model))
 }
 

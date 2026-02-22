@@ -90,6 +90,11 @@ impl Agent {
             tracing::warn!("Failed to initialize trace system: {}", e);
         }
         
+        // Initialize local embeddings if using a local model
+        if config.is_local_model() {
+            let _ = crate::llm::candle_manager::init_candle_manager("sentence-transformers/all-MiniLM-L6-v2".to_string()).await;
+        }
+        
         // Create new session
         let session = Session::new(workdir.clone(), &config.provider, &config.model);
         
@@ -267,91 +272,73 @@ impl Agent {
         self.session.as_ref().map(|s| s.id.as_str())
     }
 
-    /// Run a single prompt with a multi-turn reasoning loop
+    /// Run a single prompt.
+    ///
+    /// Rig's `agent.chat()` drives the full agentic loop: it calls
+    /// `completion()`, executes any tool calls the model returns, feeds the
+    /// results back, and repeats until the model produces a plain-text answer.
+    /// We therefore only need to call it once per user prompt.
     pub async fn run_prompt(&mut self, prompt: &str) -> Result<()> {
         println!("📝 Task: {prompt}\n");
 
         // Start background doc prefetch for this query
         self.doc_prefetcher.prefetch_async(prompt.to_string());
 
-        // Initial phase
+        // Reset phase
         self.current_phase = AgentPhase::Explore;
         {
             let mut state = self.tool_state.lock().unwrap();
             state.current_phase = AgentPhase::Explore;
         }
 
-        let mut turn_count = 0;
-        let max_turns = 15;
-        let mut current_input = prompt.to_string();
-
-        while turn_count < max_turns {
-            turn_count += 1;
-            
-            // Route to appropriate model based on phase
-            let rig_agent = match self.current_phase {
-                AgentPhase::Explore | AgentPhase::Think => self.planner.as_ref(),
-                AgentPhase::Verify => self.reasoner.as_ref(),
-                AgentPhase::Execute => self.tool_caller.as_ref(),
-            }.ok_or_else(|| anyhow::anyhow!("Rig agent for phase {:?} not initialized", self.current_phase))?;
-            
-            // Convert existing messages to Rig format
-            let mut rig_history: Vec<RigMessage> = Vec::new();
-            for msg in &self.messages {
-                match msg.role {
-                    Role::User => rig_history.push(RigMessage::user(&msg.content)),
-                    Role::Assistant => rig_history.push(RigMessage::assistant(&msg.content)),
-                    _ => {} 
-                }
+        // Convert stored conversation history to rig Message format
+        let rig_history: Vec<RigMessage> = self.messages.iter().filter_map(|msg| {
+            match msg.role {
+                Role::User => Some(RigMessage::user(&msg.content)),
+                Role::Assistant => Some(RigMessage::assistant(&msg.content)),
+                _ => None,
             }
+        }).collect();
 
-            // Use Rig's chat interface
-            let response = match rig_agent {
-                RigAgentEnum::OpenAI(agent) => agent.chat(&current_input, rig_history).await?,
-                RigAgentEnum::Anthropic(agent) => agent.chat(&current_input, rig_history).await?,
-                RigAgentEnum::Gemini(agent) => agent.chat(&current_input, rig_history).await?,
-                RigAgentEnum::MLX(agent) => agent.chat(&current_input, rig_history).await?,
-            };
-            
-            println!("\n🤖 Turn {}:\n{}\n", turn_count, response);
-            
-            // Sync state from tools
-            {
-                let state = self.tool_state.lock().unwrap();
-                self.current_phase = state.current_phase;
-                self.plan = state.plan.clone();
-            }
+        // Pick the right agent for the current phase
+        let rig_agent = match self.current_phase {
+            AgentPhase::Explore | AgentPhase::Think => self.planner.as_ref(),
+            AgentPhase::Verify => self.reasoner.as_ref(),
+            AgentPhase::Execute => self.tool_caller.as_ref(),
+        }.ok_or_else(|| anyhow::anyhow!("Rig agent not initialized"))?;
 
-            // Record messages
-            self.messages.push(Message {
-                role: Role::User,
-                content: current_input.clone(),
-                tool_calls: None,
-                tool_results: None,
-            });
-            
-            self.messages.push(Message {
-                role: Role::Assistant,
-                content: response.clone(),
-                tool_calls: None,
-                tool_results: None,
-            });
+        // One call — rig handles the internal tool-call / result loop
+        let response = match rig_agent {
+            RigAgentEnum::OpenAI(agent) => agent.chat(prompt, rig_history).await?,
+            RigAgentEnum::Anthropic(agent) => agent.chat(prompt, rig_history).await?,
+            RigAgentEnum::Gemini(agent) => agent.chat(prompt, rig_history).await?,
+            RigAgentEnum::MLX(agent) => agent.chat(prompt, rig_history).await?,
+        };
 
-            self.save_session().ok();
+        println!("\n{}\n", response);
 
-            // Check for completion or termination
-            if response.contains("attempt_completion") || response.contains("ask_followup_question") {
-                break;
-            }
-
-            // If we're just continuing, prepare for next turn
-            current_input = "Continue with the next step in your plan or phase.".to_string();
+        // Sync any phase / plan updates written by tools
+        {
+            let state = self.tool_state.lock().unwrap();
+            self.current_phase = state.current_phase;
+            self.plan = state.plan.clone();
         }
 
-        if turn_count >= max_turns {
-            println!("⚠️ Reached maximum reasoning turns ({})", max_turns);
-        }
+        // Persist the exchange
+        self.messages.push(Message {
+            role: Role::User,
+            content: prompt.to_string(),
+            tool_calls: None,
+            tool_results: None,
+        });
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: response,
+            tool_calls: None,
+            tool_results: None,
+        });
 
+        self.save_session().ok();
         Ok(())
     }
 

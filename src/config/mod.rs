@@ -255,11 +255,11 @@ impl Config {
                 config.local_server_url = Some("native-mlx".to_string()); // Native MLX integration
             }
             
-            // Intel/AMD64 defaults
+            // Non-Apple Silicon defaults (fallback to Gemini/Cloud or local MLX if possible)
             #[cfg(not(target_arch = "aarch64"))]
             {
-                config.model = "llama3.2".to_string();
-                config.local_server_url = Some("http://localhost:11434".to_string()); // Ollama
+                config.model = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".to_string();
+                config.local_server_url = Some("native-mlx".to_string());
             }
             
             return config;
