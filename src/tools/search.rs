@@ -23,16 +23,7 @@ fn get_provider_config() -> &'static StdRwLock<Option<EmbeddingProvider>> {
 
 /// Initialize embedding provider from LLM config (call once at startup)
 pub fn init_embedding_provider(provider: &str, api_key: Option<&str>, base_url: Option<&str>) {
-    let is_local = provider == "mlx" || base_url.map_or(false, |u| u.contains("localhost") || u.contains("127.0.0.1") || u == "native-mlx");
-    
-    let embedding_provider = if is_local {
-        tracing::info!("Local model detected, forcing Candle embeddings for offline search");
-        EmbeddingProvider::Candle { 
-            model_name: "sentence-transformers/all-MiniLM-L6-v2".to_string() 
-        }
-    } else {
-        EmbeddingProvider::from_config(provider, api_key, base_url)
-    };
+    let embedding_provider = EmbeddingProvider::from_config(provider, api_key, base_url);
 
     if let Ok(mut guard) = get_provider_config().write() {
         *guard = Some(embedding_provider);
@@ -529,6 +520,12 @@ pub async fn index_files(args: &Value, workdir: &Path) -> ToolResult {
         Err(e) => return ToolResult::err(format!("Failed to open embedding database: {}", e)),
     };
 
+    // Create embedding store once for the whole batch
+    let store = match super::embeddings::EmbeddingStore::new(provider.clone()) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::err(format!("Failed to create embedding store: {}", e)),
+    };
+
     // Process each file
     for file_obj in files_array {
         let Some(path) = file_obj.get("path").and_then(|v| v.as_str()) else {
@@ -538,20 +535,25 @@ pub async fn index_files(args: &Value, workdir: &Path) -> ToolResult {
             continue;
         };
 
-        // Parse code into chunks (simplified - could use tree-sitter for better parsing)
         let chunks = chunk_code_content(content, path);
-        
-        for chunk in chunks {
-            // Generate embedding - TODO: Fix embedding API
-            let embedding = vec![0.0f32; 384]; // Placeholder embedding
-            {
-                // Store in database
-                if let Err(e) = db.store_embedding(&chunk.id, &embedding, &chunk.content, path) {
-                    tracing::warn!("Failed to store embedding for {}: {}", path, e);
-                } else {
-                    embeddings_generated += 1;
-                    nodes_created += 1;
-                }
+        if chunks.is_empty() {
+            files_indexed += 1;
+            continue;
+        }
+
+        // Batch embed all chunks for this file in one call
+        let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        let embeddings = store.embed_texts_public(&texts).await.unwrap_or_else(|e| {
+            tracing::warn!("Embedding failed for {}: {}", path, e);
+            chunks.iter().map(|_| vec![0.0f32; 384]).collect()
+        });
+
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+            if let Err(e) = db.store_embedding(&chunk.id, embedding, &chunk.content, path) {
+                tracing::warn!("Failed to store embedding for {}: {}", path, e);
+            } else {
+                embeddings_generated += 1;
+                nodes_created += 1;
             }
         }
 
@@ -599,6 +601,16 @@ pub async fn reindex_workspace(args: &Value, workdir: &Path) -> ToolResult {
     let mut nodes_created = 0;
     let mut embeddings_generated = 0;
 
+    // Create embedding store and database once for the whole workspace scan
+    let store = match super::embeddings::EmbeddingStore::new(provider.clone()) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::err(format!("Failed to create embedding store: {}", e)),
+    };
+    let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
+        Ok(db) => db,
+        Err(e) => return ToolResult::err(format!("Failed to open embedding database: {}", e)),
+    };
+
     // Scan all code files in workspace
     for entry in WalkDir::new(workdir)
         .follow_links(false)
@@ -616,44 +628,41 @@ pub async fn reindex_workspace(args: &Value, workdir: &Path) -> ToolResult {
     {
         let path = entry.path();
         let rel_path = path.strip_prefix(workdir).unwrap_or(path);
-        
-        // Only index code files
-        if !is_code_file(&rel_path.to_string_lossy()) {
+        let rel_str = rel_path.to_string_lossy();
+
+        if !is_code_file(&rel_str) {
             continue;
         }
 
-        // Read file content
         let content = match tokio::fs::read_to_string(path).await {
             Ok(content) => content,
             Err(_) => continue,
         };
 
-        // Open database for this file
-        let db = match super::embeddings_store::EmbeddingDb::open(workdir, provider.clone()) {
-            Ok(db) => db,
-            Err(_) => continue,
-        };
+        let chunks = chunk_code_content(&content, &rel_str);
+        if chunks.is_empty() {
+            files_indexed += 1;
+            continue;
+        }
 
-        // Parse and index chunks
-        let chunks = chunk_code_content(&content, &rel_path.to_string_lossy());
-        
-        for chunk in chunks {
-            // Generate embedding - TODO: Fix embedding API
-            let embedding = vec![0.0f32; 384]; // Placeholder embedding
-            {
-                // Store in database
-                if let Err(e) = db.store_embedding(&chunk.id, &embedding, &chunk.content, &rel_path.to_string_lossy()) {
-                    tracing::warn!("Failed to store embedding for {}: {}", rel_path.display(), e);
-                } else {
-                    embeddings_generated += 1;
-                    nodes_created += 1;
-                }
+        // Batch embed all chunks for this file in one call
+        let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        let embeddings = store.embed_texts_public(&texts).await.unwrap_or_else(|e| {
+            tracing::warn!("Embedding failed for {}: {}", rel_str, e);
+            chunks.iter().map(|_| vec![0.0f32; 384]).collect()
+        });
+
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+            if let Err(e) = db.store_embedding(&chunk.id, embedding, &chunk.content, &rel_str) {
+                tracing::warn!("Failed to store embedding for {}: {}", rel_str, e);
+            } else {
+                embeddings_generated += 1;
+                nodes_created += 1;
             }
         }
 
         files_indexed += 1;
 
-        // Progress update every 10 files
         if files_indexed % 10 == 0 {
             tracing::info!("Indexed {} files so far...", files_indexed);
         }

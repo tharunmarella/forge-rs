@@ -441,3 +441,159 @@ fn extract_definitions_regex(content: &str, ext: &str) -> Vec<String> {
     defs.sort_by_key(|d| d.split(':').next().unwrap_or("0").trim().parse::<usize>().unwrap_or(0));
     defs
 }
+
+/// Search for function/method definitions by name
+pub async fn search_functions(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'query' parameter");
+    };
+    let search_path = args.get("path").and_then(|v| v.as_str())
+        .map(|p| workdir.join(p))
+        .unwrap_or_else(|| workdir.to_path_buf());
+
+    let patterns = [
+        format!(r"(?:pub\s+)?(?:async\s+)?fn\s+{}", regex::escape(query)),     // Rust
+        format!(r"(?:async\s+)?def\s+{}\s*\(", regex::escape(query)),          // Python
+        format!(r"(?:async\s+)?function\s+{}\s*[\(<]", regex::escape(query)),  // JS/TS
+        format!(r"func\s+(?:\([^)]+\)\s+)?{}\s*\(", regex::escape(query)),     // Go
+    ];
+
+    let grep_args = serde_json::json!({
+        "pattern": patterns.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("|"),
+        "path": search_path.to_string_lossy(),
+        "context": 1
+    });
+    super::search::grep(&grep_args, workdir).await
+}
+
+/// Search for struct/class/interface/type definitions by name
+pub async fn search_classes(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'query' parameter");
+    };
+    let search_path = args.get("path").and_then(|v| v.as_str())
+        .map(|p| workdir.join(p))
+        .unwrap_or_else(|| workdir.to_path_buf());
+
+    let escaped = regex::escape(query);
+    let pattern = format!(
+        r"(?:pub\s+)?(?:struct|enum|trait|class|interface|type)\s+{}",
+        escaped
+    );
+
+    let grep_args = serde_json::json!({
+        "pattern": pattern,
+        "path": search_path.to_string_lossy(),
+        "context": 1
+    });
+    super::search::grep(&grep_args, workdir).await
+}
+
+/// Find files by name pattern
+pub async fn search_files(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'query' parameter");
+    };
+    let base = args.get("path").and_then(|v| v.as_str())
+        .map(|p| workdir.join(p))
+        .unwrap_or_else(|| workdir.to_path_buf());
+
+    // Build a glob: if query already contains * use as-is, else wrap with **/*query*
+    let pattern = if query.contains('*') || query.contains('/') {
+        query.to_string()
+    } else {
+        format!("**/*{}*", query)
+    };
+
+    let glob_args = serde_json::json!({ "pattern": pattern, "path": base.to_string_lossy() });
+    super::search::glob_search(&glob_args, workdir).await
+}
+
+/// LSP go-to-definition at exact position
+pub async fn lsp_go_to_definition(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'path' parameter");
+    };
+    let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let character = args.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let full_path = workdir.join(path);
+
+    let Some(mgr_mutex) = get_lsp_manager(workdir).await else {
+        return ToolResult::err("LSP manager unavailable");
+    };
+    let guard = mgr_mutex.lock().await;
+    let Some(ref mgr) = *guard else {
+        return ToolResult::err("LSP manager not initialized");
+    };
+
+    match mgr.go_to_definition(&full_path, line, character).await {
+        Some(locations) if !locations.is_empty() => {
+            let mut out = format!("Definition(s) found ({}):\n", locations.len());
+            for loc in locations.iter().take(5) {
+                let def_path = loc.uri.trim_start_matches("file://");
+                let snippet = std::fs::read_to_string(def_path).ok()
+                    .and_then(|c| c.lines().nth(loc.range.start.line as usize).map(|l| l.trim().to_string()))
+                    .unwrap_or_default();
+                out.push_str(&format!("  {}:{} — {}\n", def_path, loc.range.start.line + 1, snippet));
+            }
+            ToolResult::ok(out)
+        }
+        _ => ToolResult::err(format!("No definition found at {}:{}:{}", path, line, character)),
+    }
+}
+
+/// LSP find-all-references at exact position
+pub async fn lsp_find_references(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'path' parameter");
+    };
+    let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let character = args.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let full_path = workdir.join(path);
+
+    let Some(mgr_mutex) = get_lsp_manager(workdir).await else {
+        return ToolResult::err("LSP manager unavailable");
+    };
+    let guard = mgr_mutex.lock().await;
+    let Some(ref mgr) = *guard else {
+        return ToolResult::err("LSP manager not initialized");
+    };
+
+    match mgr.find_references(&full_path, line, character).await {
+        Some(locations) if !locations.is_empty() => {
+            let mut out = format!("Found {} reference(s):\n", locations.len());
+            for loc in locations.iter().take(50) {
+                let ref_path = loc.uri.trim_start_matches("file://");
+                let snippet = std::fs::read_to_string(ref_path).ok()
+                    .and_then(|c| c.lines().nth(loc.range.start.line as usize).map(|l| l.trim().to_string()))
+                    .unwrap_or_default();
+                out.push_str(&format!("  {}:{} — {}\n", ref_path, loc.range.start.line + 1, snippet));
+            }
+            ToolResult::ok(out)
+        }
+        _ => ToolResult::err(format!("No references found at {}:{}:{}", path, line, character)),
+    }
+}
+
+/// LSP hover — type info and docs at position
+pub async fn lsp_hover(args: &Value, workdir: &Path) -> ToolResult {
+    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+        return ToolResult::err("Missing 'path' parameter");
+    };
+    let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let character = args.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let full_path = workdir.join(path);
+
+    let Some(mgr_mutex) = get_lsp_manager(workdir).await else {
+        return ToolResult::err("LSP manager unavailable");
+    };
+    let guard = mgr_mutex.lock().await;
+    let Some(ref mgr) = *guard else {
+        return ToolResult::err("LSP manager not initialized");
+    };
+
+    match mgr.hover(&full_path, line, character).await {
+        Some(info) => ToolResult::ok(info),
+        None => ToolResult::err(format!("No hover info at {}:{}:{}", path, line, character)),
+    }
+}

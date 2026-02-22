@@ -331,16 +331,22 @@ async fn handle_slash_command(app: &mut App, cmd: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_message(_terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, prompt: &str) -> Result<()> {
-    
+async fn send_message(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, prompt: &str) -> Result<()> {
+
     app.agent.prefetch_docs(prompt);
     app.messages.push(ChatMessage { role: ChatRole::User, content: prompt.to_string(), tools: vec![] });
     app.agent.messages.push(Message { role: Role::User, content: prompt.to_string(), tool_calls: None, tool_results: None });
 
     if let Some(ref mut ckpt) = app.checkpoint { ckpt.create(&format!("before: {}", &prompt[..prompt.len().min(30)])).ok(); }
 
+    // Redraw immediately so the user message appears before we block on the model call
+    terminal.draw(|f| draw_ui(f, app))?;
+
     app.is_thinking = true;
     app.messages.push(ChatMessage { role: ChatRole::Assistant, content: String::new(), tools: vec![] });
+
+    // Redraw again to show the thinking spinner before blocking
+    terminal.draw(|f| draw_ui(f, app))?;
     
     // Convert existing messages to Rig format
     let mut rig_history: Vec<rig::completion::Message> = Vec::new();
@@ -352,18 +358,13 @@ async fn send_message(_terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &
         }
     }
 
-    // Use Rig's chat interface with Tri-Model selection
-    let agent_enum = match app.agent.current_phase {
-        crate::api::AgentPhase::Explore | crate::api::AgentPhase::Think => &app.agent.planner,
-        crate::api::AgentPhase::Verify => &app.agent.reasoner,
-        crate::api::AgentPhase::Execute => &app.agent.tool_caller,
-    }.as_ref().ok_or_else(|| anyhow::anyhow!("Rig agent for phase {:?} not initialized", app.agent.current_phase))?;
+    let agent_enum = app.agent.agent.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Agent not initialized"))?;
 
     let response: String = match agent_enum {
         crate::api::RigAgentEnum::OpenAI(agent) => agent.chat(prompt, rig_history).await?,
         crate::api::RigAgentEnum::Anthropic(agent) => agent.chat(prompt, rig_history).await?,
         crate::api::RigAgentEnum::Gemini(agent) => agent.chat(prompt, rig_history).await?,
-        crate::api::RigAgentEnum::MLX(agent) => agent.chat(prompt, rig_history).await?,
     };
     
     app.is_thinking = false;

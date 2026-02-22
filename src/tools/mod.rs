@@ -59,6 +59,13 @@ pub enum Tool {
     TraceCallChain,
     ImpactAnalysis,
     Diagnostics,
+    GetArchitectureMap,
+    SearchFunctions,
+    SearchClasses,
+    SearchFiles,
+    LspGoToDefinition,
+    LspFindReferences,
+    LspHover,
     
     // Web & Documentation
     WebSearch,
@@ -76,6 +83,7 @@ pub enum Tool {
     AddPlanStep,
     RemovePlanStep,
     DiscardPlan,
+    Replan,
     
     // Mode control (internal)
     PlanModeRespond,
@@ -117,6 +125,13 @@ impl Tool {
             Self::GetSymbolDefinition => "get_symbol_definition",
             Self::FindSymbolReferences => "find_symbol_references",
             Self::Diagnostics => "diagnostics",
+            Self::GetArchitectureMap => "get_architecture_map",
+            Self::SearchFunctions => "search_functions",
+            Self::SearchClasses => "search_classes",
+            Self::SearchFiles => "search_files",
+            Self::LspGoToDefinition => "lsp_go_to_definition",
+            Self::LspFindReferences => "lsp_find_references",
+            Self::LspHover => "lsp_hover",
             Self::WebSearch => "web_search",
             Self::WebFetch => "web_fetch",
             Self::FetchDocs => "fetch_documentation",
@@ -133,6 +148,7 @@ impl Tool {
             Self::FocusChain => "focus_chain",
             Self::TraceCallChain => "trace_call_chain",
             Self::ImpactAnalysis => "impact_analysis",
+            Self::Replan => "replan",
         }
     }
 
@@ -171,6 +187,14 @@ impl Tool {
             "trace_call_chain" => Some(Self::TraceCallChain),
             "impact_analysis" => Some(Self::ImpactAnalysis),
             "diagnostics" => Some(Self::Diagnostics),
+            "get_architecture_map" => Some(Self::GetArchitectureMap),
+            "search_functions" => Some(Self::SearchFunctions),
+            "search_classes" => Some(Self::SearchClasses),
+            "search_files" => Some(Self::SearchFiles),
+            "lsp_go_to_definition" => Some(Self::LspGoToDefinition),
+            "lsp_find_references" => Some(Self::LspFindReferences),
+            "lsp_hover" => Some(Self::LspHover),
+            "replan" => Some(Self::Replan),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
             "fetch_documentation" => Some(Self::FetchDocs),
@@ -456,12 +480,19 @@ pub async fn execute(tool: &ToolCall, workdir: &Path, plan_mode: bool) -> ToolRe
         Tool::TraceCallChain => code::trace_call_chain(&tool.arguments, workdir).await,
         Tool::ImpactAnalysis => code::impact_analysis(&tool.arguments, workdir).await,
         Tool::Diagnostics => lint::diagnostics(&tool.arguments, workdir).await,
+        Tool::GetArchitectureMap => generate_repo_map(&tool.arguments, workdir).await,
+        Tool::SearchFunctions => code::search_functions(&tool.arguments, workdir).await,
+        Tool::SearchClasses => code::search_classes(&tool.arguments, workdir).await,
+        Tool::SearchFiles => code::search_files(&tool.arguments, workdir).await,
+        Tool::LspGoToDefinition => code::lsp_go_to_definition(&tool.arguments, workdir).await,
+        Tool::LspFindReferences => code::lsp_find_references(&tool.arguments, workdir).await,
+        Tool::LspHover => code::lsp_hover(&tool.arguments, workdir).await,
         Tool::WebSearch => web::search(&tool.arguments).await,
         Tool::WebFetch => web::fetch(&tool.arguments).await,
         Tool::FetchDocs => web::fetch_docs(&tool.arguments).await,
         
-        // These are handled specially by the agent
-        Tool::AttemptCompletion 
+        // These are handled in ForgeToolAdapter before reaching execute()
+        Tool::AttemptCompletion
         | Tool::AskFollowupQuestion
         | Tool::PlanModeRespond
         | Tool::ActModeRespond
@@ -471,6 +502,7 @@ pub async fn execute(tool: &ToolCall, workdir: &Path, plan_mode: bool) -> ToolRe
         | Tool::AddPlanStep
         | Tool::RemovePlanStep
         | Tool::DiscardPlan
+        | Tool::Replan
         | Tool::Think => ToolResult::ok(""),
     };
     
@@ -827,15 +859,179 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
                 "required": ["thought"]
             }
         }),
+        // Architecture & search
+        serde_json::json!({
+            "name": "get_architecture_map",
+            "description": "Get a hierarchical map of the codebase: key files, symbols, and their locations. Use this first to understand project structure before diving into code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": "integer", "description": "Token budget for the map (default: 2048)" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "search_functions",
+            "description": "Find function/method definitions by name pattern across the codebase. Use when you know the name of a function and want to find where it's defined.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Function name or partial name to search for" },
+                    "path": { "type": "string", "description": "Optional: limit search to this directory" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "search_classes",
+            "description": "Find struct/class/interface/type definitions by name across the codebase.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Type name or partial name to search for" },
+                    "path": { "type": "string", "description": "Optional: limit search to this directory" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "search_files",
+            "description": "Find files by name pattern (e.g. 'auth', 'config', '*.test.ts'). Returns matching file paths.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Filename or glob pattern to search for" },
+                    "path": { "type": "string", "description": "Optional: root directory to search in" }
+                },
+                "required": ["query"]
+            }
+        }),
+        // LSP tools
+        serde_json::json!({
+            "name": "lsp_go_to_definition",
+            "description": "Precise LSP-based jump to the definition of a symbol. More accurate than get_symbol_definition when you have an exact file position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path where the symbol appears" },
+                    "line": { "type": "integer", "description": "Line number (0-indexed)" },
+                    "character": { "type": "integer", "description": "Character offset (0-indexed)" }
+                },
+                "required": ["path", "line", "character"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_find_references",
+            "description": "Find all usages of a symbol via LSP. More accurate than find_symbol_references when you have an exact file position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path where the symbol is defined" },
+                    "line": { "type": "integer", "description": "Line number (0-indexed)" },
+                    "character": { "type": "integer", "description": "Character offset (0-indexed)" }
+                },
+                "required": ["path", "line", "character"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_hover",
+            "description": "Get type information and documentation for a symbol at a specific position via LSP.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path" },
+                    "line": { "type": "integer", "description": "Line number (0-indexed)" },
+                    "character": { "type": "integer", "description": "Character offset (0-indexed)" }
+                },
+                "required": ["path", "line", "character"]
+            }
+        }),
+        // Replan
+        serde_json::json!({
+            "name": "replan",
+            "description": "Replace the current plan with a new one when the original approach isn't working. Include the reason for replanning.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string", "description": "Why the current plan failed or needs to change" },
+                    "steps": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "New ordered list of steps"
+                    }
+                },
+                "required": ["reason", "steps"]
+            }
+        }),
         serde_json::json!({
             "name": "attempt_completion",
-            "description": "Signal task completion with a result message",
+            "description": "Signal that the task is fully complete. Call this when all work is done and verified. Include a concise summary of what was accomplished.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "result": { "type": "string", "description": "Summary of what was done" }
                 },
                 "required": ["result"]
+            }
+        }),
+        // Planning tools
+        serde_json::json!({
+            "name": "create_plan",
+            "description": "Create a step-by-step plan for a complex multi-file task. Call after exploring the codebase. Each step should be atomic and verifiable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered list of step descriptions"
+                    }
+                },
+                "required": ["steps"]
+            }
+        }),
+        serde_json::json!({
+            "name": "update_plan",
+            "description": "Update the status or description of a plan step as you execute it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "step_number": { "type": "integer", "description": "The step number to update (1-indexed)" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "done", "failed"], "description": "New status for the step" },
+                    "new_description": { "type": "string", "description": "Optional updated description" }
+                },
+                "required": ["step_number", "status"]
+            }
+        }),
+        serde_json::json!({
+            "name": "add_plan_step",
+            "description": "Insert a new step into the plan after a given position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "after_step": { "type": "integer", "description": "Insert after this step number (0 = prepend)" },
+                    "description": { "type": "string", "description": "Description of the new step" }
+                },
+                "required": ["after_step", "description"]
+            }
+        }),
+        serde_json::json!({
+            "name": "remove_plan_step",
+            "description": "Remove a step from the plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "step_number": { "type": "integer", "description": "The step number to remove (1-indexed)" }
+                },
+                "required": ["step_number"]
+            }
+        }),
+        serde_json::json!({
+            "name": "discard_plan",
+            "description": "Discard the entire current plan and start fresh.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
             }
         }),
     ];
@@ -847,15 +1043,9 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             !matches!(name, "execute_command" | "write_to_file" | "replace_in_file" | "apply_patch" | "execute_background" | "kill_process" | "kill_port")
         });
     }
-    
-    // TEMPORARY: Remove attempt_completion to debug Gemini duplicate error
-    tools.retain(|t| {
-        let name = t["name"].as_str().unwrap_or("");
-        name != "attempt_completion"
-    });
 
     tools
 }
 
 // Re-export functions needed by api/mod.rs
-pub use search::{init_embedding_provider, start_background_indexing};
+pub use search::{init_embedding_provider, start_background_indexing, semantic as codebase_search, grep};

@@ -314,12 +314,10 @@ pub async fn is_candle_available() -> bool {
 pub fn get_recommended_apple_silicon_models() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         // (Model Name, Size, Description)
-        ("mlx-community/Llama-3.2-3B-Instruct-4bit", "~2GB", "🍎 Fast, efficient for coding tasks"),
-        ("mlx-community/Llama-3.2-1B-Instruct-4bit", "~1GB", "🍎 Ultra-fast, good for simple tasks"),
-        ("mlx-community/CodeLlama-7B-Instruct-4bit", "~4GB", "🍎 Specialized for code generation"),
-        ("mlx-community/Mistral-7B-Instruct-v0.3-4bit", "~4GB", "🍎 Excellent reasoning capabilities"),
-        ("mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", "~4GB", "🍎 Latest coding model"),
-        ("mlx-community/deepseek-coder-6.7b-instruct-4bit", "~4GB", "🍎 Strong code understanding"),
+        ("mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit", "~1GB",  "🍎 Ultra-fast, 8GB Mac"),
+        ("mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",   "~4GB",  "🍎 Balanced, 16GB Mac"),
+        ("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit","~8GB",  "🍎 Best quality, 32GB Mac (MoE)"),
+        ("mlx-community/Qwen3-Coder-Next-4bit",            "~40GB", "🍎 Max quality, 64GB Mac"),
     ]
 }
 
@@ -414,19 +412,19 @@ pub fn get_optimal_mlx_config() -> (String, String, u16) {
                 if let Ok(mem_bytes) = mem_str.trim().parse::<u64>() {
                     let mem_gb = mem_bytes / (1024 * 1024 * 1024);
                     match mem_gb {
-                        0..=8 => "mlx-community/Llama-3.2-1B-Instruct-4bit",
-                        9..=16 => "mlx-community/Llama-3.2-3B-Instruct-4bit", 
-                        17..=32 => "mlx-community/CodeLlama-7B-Instruct-4bit",
-                        _ => "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+                        0..=8  => "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit",
+                        9..=16 => "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+                        17..=32 => "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+                        _ => "mlx-community/Qwen3-Coder-Next-4bit",
                     }
                 } else {
-                    "mlx-community/Llama-3.2-3B-Instruct-4bit" // Safe default
+                    "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" // Safe default
                 }
             } else {
-                "mlx-community/Llama-3.2-3B-Instruct-4bit" // Safe default
+                "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" // Safe default
             }
         } else {
-            "mlx-community/Llama-3.2-3B-Instruct-4bit" // Safe default
+            "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" // Safe default
         };
         
         (model.to_string(), "http://localhost:8000".to_string(), 8000)

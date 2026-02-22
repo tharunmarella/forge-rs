@@ -100,17 +100,16 @@ impl EmbeddingProvider {
                 }
             },
             "mlx" => {
-                // MLX doesn't support embedding models yet in mlx-lm
-                // Disable embeddings for now
-                tracing::info!("MLX embeddings not yet supported, disabling semantic search");
-                EmbeddingProvider::None
-            },
-            // Default: try local models fallback, then disable
-            _ => {
-                tracing::info!("Provider {} doesn't support embeddings, trying local models fallback", provider);
-                EmbeddingProvider::Candle { 
-                    model_name: "sentence-transformers/all-MiniLM-L6-v2".to_string() 
+                // Qwen3-Embedding-0.6B: fast, code-aware, fits any Apple Silicon Mac
+                // Start server: python -m mlx_lm.server --model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
+                tracing::info!("MLX provider: using Qwen3-Embedding-0.6B-4bit-DWQ via local MLX server");
+                EmbeddingProvider::Candle {
+                    model_name: "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ".to_string(),
                 }
+            },
+            _ => {
+                tracing::warn!("Provider {} doesn't support embeddings, semantic search disabled", provider);
+                EmbeddingProvider::None
             },
         }
     }

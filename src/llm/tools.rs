@@ -110,6 +110,19 @@ impl Tool for ForgeToolAdapter {
                 state.plan.clear();
                 return Ok("Plan discarded.".to_string());
             }
+            "replan" => {
+                let mut state = self.state.lock().unwrap();
+                let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("unspecified");
+                if let Some(steps) = args.get("steps").and_then(|v| v.as_array()) {
+                    state.plan = steps.iter().enumerate().map(|(i, s)| PlanStep {
+                        number: (i + 1) as i32,
+                        description: s.as_str().unwrap_or("").to_string(),
+                        status: "pending".to_string(),
+                    }).collect();
+                    return Ok(format!("Replanned with {} steps. Reason: {}", state.plan.len(), reason));
+                }
+                return Ok(format!("Replan failed: missing 'steps'. Reason: {}", reason));
+            }
             _ => {}
         }
 

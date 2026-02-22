@@ -97,12 +97,11 @@ const PROVIDERS: &[Provider] = &[
         name: "Local Models - Apple Silicon",
         id: "mlx",
         models: &[
-            "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit (🔥 Context)",
-            "mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit (🧠 Thinking)",
-            "mlx-community/GLM-4.7-Flash-4bit (⚡ Agentic)",
-            "mlx-community/gpt-oss-20b-MXFP4-Q4 (💎 Tools)",
-            "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit (Balanced)",
-            "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit (Fast)",
+            "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit (⚡ Ultra Fast — 8GB)",
+            "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit (Balanced — 16GB)",
+            "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit (🔥 Best — 32GB)",
+            "mlx-community/Qwen3-Coder-Next-4bit (🧠 Max Quality — 64GB)",
+            "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit (💎 Frontier — 192GB)",
         ],
         env_var: "LOCAL_MODELS", // Not actually used but required by struct
         base_url: None,
@@ -200,9 +199,9 @@ fn run_setup_loop(
                             config.model = model_name.to_string();
                             config.base_url = provider.base_url.map(|s| s.to_string());
                             
-                            // Set local_server_url for MLX provider
+                            // MLX uses mlx_lm.server — store the local server URL
                             if provider.id == "mlx" {
-                                config.local_server_url = Some("native-mlx".to_string());
+                                config.base_url = Some("http://localhost:8000/v1".to_string());
                             }
                             
                             match provider.id {
@@ -215,37 +214,18 @@ fn run_setup_loop(
                             
                             config.save()?;
                             
-                            // For MLX, download model during setup
+                            // For MLX, show server start instructions
                             if provider.id == "mlx" {
-                                // Exit TUI temporarily to show progress bar
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                
-                                println!("\n📥 Downloading model files...");
-                                println!("This may take several minutes (~2-4GB)\n");
-                                
-                                // Initialize MLX manager (this will download the model with progress bar)
-                                use crate::llm::mlx_native;
-                                let model_name = config.model.clone();
-                                
-                                // Run async code in sync context
-                                let result = tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(async {
-                                        mlx_native::init_mlx_native_manager(model_name).await
-                                    })
-                                });
-                                
-                                match result {
-                                    Ok(_) => {
-                                        println!("\n✓ Model downloaded and ready!");
-                                    }
-                                    Err(e) => {
-                                        eprintln!("\n✗ Failed to download model: {}", e);
-                                        eprintln!("You can try again by running 'forge' - it will retry the download.");
-                                    }
-                                }
-                                
-                                // Re-enter TUI
+
+                                println!("\n✓ MLX configured. Before running forge, start the model server:\n");
+                                println!("  pip install mlx-lm");
+                                println!("  python -m mlx_lm.server --model {}\n", config.model);
+                                println!("Forge will connect to http://localhost:8000/v1 automatically.\n");
+                                println!("Press Enter to continue...");
+                                let _ = std::io::stdin().read_line(&mut String::new());
+
                                 enable_raw_mode()?;
                                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                 terminal.clear()?;

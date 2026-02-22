@@ -7,19 +7,6 @@ use std::path::PathBuf;
 pub struct Config {
     pub provider: String,
     pub model: String,
-    
-    /// Specialized model for planning and strategy
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub planner_model: Option<String>,
-    
-    /// Specialized model for deep reasoning (e.g. o1, deepseek-r1)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoner_model: Option<String>,
-    
-    /// Specialized model for fast tool-calling (e.g. gpt-4o-mini)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_model: Option<String>,
-
     pub plan_mode: bool,
     
     /// Custom base URL for OpenAI-compatible APIs
@@ -127,11 +114,11 @@ fn default_groq_models() -> Vec<String> {
 
 fn default_mlx_models() -> Vec<String> {
     vec![
-        "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".into(),
+        "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit".into(),
         "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".into(),
-        "mlx-community/Llama-3.2-3B-Instruct-4bit".into(),
-        "mlx-community/Llama-3.1-8B-Instruct-4bit".into(),
-        "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit".into(),
+        "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit".into(),
+        "mlx-community/Qwen3-Coder-Next-4bit".into(),
+        "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit".into(),
     ]
 }
 
@@ -194,9 +181,6 @@ impl Default for Config {
         Self {
             provider: "gemini".to_string(),
             model: "gemini-2.5-flash".to_string(),
-            planner_model: None,
-            reasoner_model: None,
-            tool_model: None,
             plan_mode: false,
             base_url: None,
             models: ModelsConfig::default(),
@@ -251,14 +235,14 @@ impl Config {
             // Apple Silicon optimized defaults - prefer native MLX with Qwen models
             #[cfg(target_arch = "aarch64")]
             {
-                config.model = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".to_string();
+                config.model = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".to_string();
                 config.local_server_url = Some("native-mlx".to_string()); // Native MLX integration
             }
             
             // Non-Apple Silicon defaults (fallback to Gemini/Cloud or local MLX if possible)
             #[cfg(not(target_arch = "aarch64"))]
             {
-                config.model = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit".to_string();
+                config.model = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit".to_string();
                 config.local_server_url = Some("native-mlx".to_string());
             }
             

@@ -7,8 +7,6 @@ use anyhow::Result;
 pub mod tools;
 pub mod candle_manager;
 pub mod candle_client;
-pub mod mlx_native;
-pub mod mlx_client;
 
 pub fn create_openai_agent_builder(config: &Config) -> Result<AgentBuilder<openai::responses_api::ResponsesCompletionModel>> {
     let api_key = config.api_key().unwrap_or("local");
@@ -59,11 +57,3 @@ pub async fn create_candle_agent_builder(config: &Config) -> Result<rig::agent::
     Ok(candle_client::create_candle_agent_builder(&config.model))
 }
 
-pub async fn create_mlx_native_agent_builder(config: &Config) -> Result<rig::agent::AgentBuilder<mlx_client::MLXNativeCompletionModel>> {
-    // Initialize native MLX manager if not already done
-    if !mlx_native::is_mlx_native_available().await {
-        mlx_native::init_mlx_native_manager(config.model.clone()).await?;
-    }
-    
-    Ok(mlx_client::create_mlx_native_agent_builder(&config.model))
-}
