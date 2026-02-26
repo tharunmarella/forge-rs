@@ -206,7 +206,7 @@ fn run_setup_loop(
                             
                             // MLX uses mlx_lm.server — store the local server URL
                             if provider.id == "mlx" {
-                                config.base_url = Some("http://localhost:8000/v1".to_string());
+                                config.base_url = Some("http://localhost:8080/v1".to_string());
                             }
                             
                             match provider.id {
@@ -227,7 +227,7 @@ fn run_setup_loop(
                                 println!("\n✓ MLX configured. Before running forge, start the model server:\n");
                                 println!("  pip install mlx-lm");
                                 println!("  python -m mlx_lm.server --model {}\n", config.model);
-                                println!("Forge will connect to http://localhost:8000/v1 automatically.\n");
+                                println!("Forge will connect to http://localhost:8080/v1 automatically.\n");
                                 println!("Press Enter to continue...");
                                 let _ = std::io::stdin().read_line(&mut String::new());
 

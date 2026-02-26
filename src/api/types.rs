@@ -8,6 +8,7 @@ pub enum AgentPhase {
     Think,
     Execute,
     Verify,
+    Reflect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

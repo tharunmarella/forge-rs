@@ -57,11 +57,17 @@ pub struct Agent {
     repo_map: String,
     session: Option<Session>,
 
+    pub planner: Option<RigAgentEnum>,
+    pub tool_caller: Option<RigAgentEnum>,
+    pub reasoner: Option<RigAgentEnum>,
     pub agent: Option<RigAgentEnum>,
 
     pub current_phase: AgentPhase,
     pub plan: Vec<PlanStep>,
     pub tool_state: Arc<Mutex<crate::llm::tools::AgentState>>,
+    pub changed_files: Vec<String>,
+    pub insights: Vec<String>,
+    pub smart_enrich_count: usize,
 }
 
 impl Agent {
@@ -100,10 +106,16 @@ impl Agent {
             doc_prefetcher: DocPrefetcher::new(),
             repo_map,
             session: Some(session),
+            planner: None,
+            tool_caller: None,
+            reasoner: None,
             agent: None,
             current_phase: AgentPhase::Explore,
             plan: Vec::new(),
             tool_state,
+            changed_files: Vec::new(),
+            insights: Vec::new(),
+            smart_enrich_count: 0,
         };
 
         agent.init_rig_agent().await?;
@@ -114,8 +126,57 @@ impl Agent {
     async fn init_rig_agent(&mut self) -> Result<()> {
         let preamble = self.build_system_prompt();
         let tools = self.create_rig_tools();
+        
+        // Planner agent (has search and planning tools)
+        let mut search_tools = Vec::new();
+        for t in self.create_rig_tools() {
+            if ["codebase_search", "grep", "read_file", "list_files", "get_architecture_map", "list_code_definition_names", "search_functions", "search_classes",
+                "create_plan", "update_plan", "add_plan_step", "remove_plan_step", "replan", "discard_plan"].contains(&t.name().as_str()) {
+                search_tools.push(t);
+            }
+        }
+        self.planner = Some(self.create_agent_enum(&self.config.clone(), &preamble, search_tools).await?);
+        
+        // Tool caller (has all tools)
+        let all_tools = self.create_rig_tools();
+        self.tool_caller = Some(self.create_agent_enum(&self.config.clone(), &preamble, all_tools).await?);
+        
+        // Reasoner (no tools)
+        self.reasoner = Some(self.create_agent_enum(&self.config.clone(), &preamble, vec![]).await?);
+        
+        // Default agent (for backward compatibility)
         self.agent = Some(self.create_agent_enum(&self.config.clone(), &preamble, tools).await?);
+        
         Ok(())
+    }
+
+    fn get_rig_history(&self) -> Vec<RigMessage> {
+        let filtered: Vec<&Message> = self.messages.iter()
+            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+            .collect();
+        let window = &filtered[filtered.len().saturating_sub(30)..];
+        window.iter().map(|msg| match msg.role {
+            Role::User      => RigMessage::user(&msg.content),
+            Role::Assistant => RigMessage::assistant(&msg.content),
+            _               => unreachable!(),
+        }).collect()
+    }
+
+    async fn agent_chat(&self, role: &str, prompt: &str, history: Vec<RigMessage>) -> Result<String> {
+        let agent = match role {
+            "planner" => self.planner.as_ref(),
+            "tool_caller" => self.tool_caller.as_ref(),
+            "reasoner" => self.reasoner.as_ref(),
+            _ => self.agent.as_ref(),
+        }.ok_or_else(|| anyhow::anyhow!("Agent for role {} not initialized", role))?;
+
+        let response = match agent {
+            RigAgentEnum::OpenAI(agent) => agent.chat(prompt, history).await?,
+            RigAgentEnum::Local(agent) => agent.chat(prompt, history).await?,
+            RigAgentEnum::Anthropic(agent) => agent.chat(prompt, history).await?,
+            RigAgentEnum::Gemini(agent) => agent.chat(prompt, history).await?,
+        };
+        Ok(response)
     }
 
     fn create_rig_tools(&self) -> Vec<Box<dyn ToolDyn>> {
@@ -167,7 +228,7 @@ impl Agent {
                 // mlx_lm.server — uses /v1/chat/completions (NOT the OpenAI Responses API)
                 let base_url = config.base_url.as_deref()
                     .filter(|u| *u != "native-mlx")
-                    .unwrap_or("http://localhost:8000/v1");
+                    .unwrap_or("http://localhost:8080/v1");
                 // Auto-start the server if it isn't already running
                 llm::ensure_mlx_server(base_url, &config.model).await?;
                 let agent = llm::create_local_agent_builder(base_url, &config.model)?
@@ -212,10 +273,16 @@ impl Agent {
             doc_prefetcher: DocPrefetcher::new(),
             repo_map,
             session: Some(session),
+            planner: None,
+            tool_caller: None,
+            reasoner: None,
             agent: None,
             current_phase: AgentPhase::Explore,
             plan: Vec::new(),
             tool_state,
+            changed_files: Vec::new(),
+            insights: Vec::new(),
+            smart_enrich_count: 0,
         };
         
         agent.init_rig_agent().await?;
@@ -258,36 +325,53 @@ impl Agent {
         // Start background doc prefetch for this query
         self.doc_prefetcher.prefetch_async(prompt.to_string());
 
-        // Sliding window: keep last 30 User/Assistant messages to stay within context limits
-        let filtered: Vec<&Message> = self.messages.iter()
-            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-            .collect();
-        let window = &filtered[filtered.len().saturating_sub(30)..];
-        let rig_history: Vec<RigMessage> = window.iter().map(|msg| match msg.role {
-            Role::User      => RigMessage::user(&msg.content),
-            Role::Assistant => RigMessage::assistant(&msg.content),
-            _               => unreachable!(),
-        }).collect();
+        let rig_history = self.get_rig_history();
 
-        // Explore phase: pre-fetch relevant context before the LLM call
-        let explore_ctx = self.explore(prompt).await;
-        let augmented_prompt = if explore_ctx.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("# Pre-fetched Context\n{}\n\n# Task\n{}", explore_ctx, prompt)
+        // 1. EXPLORE
+        self.current_phase = AgentPhase::Explore;
+        println!("🔍 Phase: Explore - Analyzing codebase...");
+        let explore_prompt = format!(
+            "You are in the EXPLORE phase. Your goal is to gather context to solve the user's task.\n\
+             Task: {prompt}\n\n\
+             Use codebase_search, grep, and other search tools to understand the relevant code and architecture. \n\
+             When you have a good understanding, provide a summary of your findings and what needs to be changed."
+        );
+        let explore_results = self.agent_chat("planner", &explore_prompt, vec![]).await?;
+        let explore_results = strip_thinking(&explore_results);
+        println!("✅ Exploration complete.\n");
+
+        // 2. THINK (Planning)
+        self.current_phase = AgentPhase::Think;
+        println!("🧠 Phase: Think - Planning solution...");
+        let plan_prompt = format!(
+            "You are in the THINK phase. Based on the exploration findings, create a detailed step-by-step plan to solve the task.\n\
+             Task: {prompt}\n\n\
+             Exploration Findings:\n{explore_results}\n\n\
+             Use the `create_plan` tool to define the plan. Then provide a brief summary of the plan."
+        );
+        let _plan_summary = self.agent_chat("planner", &plan_prompt, vec![]).await?;
+        println!("✅ Plan created.\n");
+
+        // 3. EXECUTE
+        self.current_phase = AgentPhase::Execute;
+        println!("🚀 Phase: Execute - Implementation...");
+        
+        let plan_str = {
+            let state = self.tool_state.lock().unwrap();
+            state.plan.iter().map(|s| format!("{}. {} ({})", s.number, s.description, s.status)).collect::<Vec<_>>().join("\n")
         };
 
-        let rig_agent = self.agent.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Agent not initialized"))?;
-
-        // One call — rig handles the internal tool-call / result loop
-        let response = match rig_agent {
-            RigAgentEnum::OpenAI(agent) => agent.chat(&augmented_prompt, rig_history).await?,
-            RigAgentEnum::Local(agent) => agent.chat(&augmented_prompt, rig_history).await?,
-            RigAgentEnum::Anthropic(agent) => agent.chat(&augmented_prompt, rig_history).await?,
-            RigAgentEnum::Gemini(agent) => agent.chat(&augmented_prompt, rig_history).await?,
-        };
-
+        let execute_prompt = format!(
+            "You are in the EXECUTE phase. Follow the plan to solve the task.\n\
+             Task: {prompt}\n\n\
+             Exploration Findings:\n{explore_results}\n\n\
+             Current Plan:\n{plan_str}\n\n\
+             Execute the steps. Update the plan status as you go using `update_plan`. \n\
+             If you encounter issues, you can search for more info or adjust the plan. \n\
+             Finalize with a summary of what was accomplished."
+        );
+        
+        let response = self.agent_chat("tool_caller", &execute_prompt, rig_history).await?;
         let response = strip_thinking(&response);
         println!("\n{}\n", response);
 
@@ -315,54 +399,6 @@ impl Agent {
         Ok(())
     }
 
-    /// Pre-fetch relevant code context before the main LLM call (explore phase).
-    /// Runs semantic search + a keyword grep in parallel and returns a compact
-    /// context string (≤ 2000 chars) to prepend to the user prompt.
-    async fn explore(&self, prompt: &str) -> String {
-        // Extract the first "significant" word for the keyword grep
-        let keyword = prompt
-            .split_whitespace()
-            .find(|w| w.len() > 3 && !matches!(*w, "what" | "how" | "does" | "the" | "this" | "that" | "with" | "from" | "into" | "when" | "where" | "which"))
-            .unwrap_or("")
-            .trim_matches(|c: char| !c.is_alphanumeric())
-            .to_string();
-
-        let semantic_args = serde_json::json!({ "query": prompt });
-        let grep_args = serde_json::json!({ "pattern": keyword, "context": 1 });
-        let workdir = self.workdir.clone();
-
-        let (semantic_result, grep_result) = tokio::join!(
-            tools::codebase_search(&semantic_args, &workdir),
-            tools::grep(&grep_args, &workdir),
-        );
-
-        let mut parts: Vec<String> = Vec::new();
-
-        if semantic_result.success && !semantic_result.output.trim().is_empty() {
-            parts.push(format!("## Semantic search\n{}", semantic_result.output.trim()));
-        }
-        if grep_result.success && !grep_result.output.trim().is_empty() && !keyword.is_empty() {
-            parts.push(format!("## Grep: `{}`\n{}", keyword, grep_result.output.trim()));
-        }
-
-        if parts.is_empty() {
-            return String::new();
-        }
-
-        let combined = parts.join("\n\n");
-        // Cap at 2000 chars so we don't bloat the context window
-        if combined.len() > 2000 {
-            format!("{}…", &combined[..2000])
-        } else {
-            combined
-        }
-    }
-
-    /// Get completion from LLM (Legacy, now handled by Rig)
-    async fn get_completion_streaming(&self) -> Result<AgentResponse> {
-        Err(anyhow::anyhow!("Legacy completion method called. Use run_prompt instead."))
-    }
-
     fn build_system_prompt(&self) -> String {
         let mode = if self.config.plan_mode { "PLAN" } else { "ACT" };
         let phase_str = format!("{:?}", self.current_phase).to_uppercase();
@@ -372,6 +408,7 @@ impl Agent {
             AgentPhase::Think => prompts::THINK_PROMPT,
             AgentPhase::Execute => prompts::SYSTEM_PROMPT,
             AgentPhase::Verify => prompts::REPLAN_PROMPT,
+            AgentPhase::Reflect => prompts::REFLECT_PROMPT,
         };
 
         // Get any prefetched documentation
@@ -478,10 +515,6 @@ fn strip_thinking(text: &str) -> String {
     result.trim().to_string()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } 
-    else { format!("{}...", &s[..max]) }
-}
 
 impl Agent {
     /// Gracefully shutdown the agent and any managed resources
