@@ -53,9 +53,17 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     
+    /// Max turn limit for agent tool-calling loops (default: 10)
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u64,
+    
     /// Local model server URL (for Ollama, LocalAI, MLX, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_server_url: Option<String>,
+}
+
+fn default_max_turns() -> u64 {
+    10
 }
 
 fn default_max_retries() -> u32 {
@@ -197,6 +205,7 @@ impl Default for Config {
             edit_format: "auto".to_string(), // Auto-detect based on model
             no_repomap: false,
             timeout: None,
+            max_turns: 10,
             local_server_url: None,
         }
     }

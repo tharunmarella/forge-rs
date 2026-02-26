@@ -206,6 +206,7 @@ impl Agent {
             "openai" | "groq" | "together" | "openrouter" => {
                 let agent = llm::create_openai_agent_builder(config)?
                     .preamble(preamble)
+                    .default_max_turns(config.max_turns as usize)
                     .tools(tools)
                     .build();
                 Ok(RigAgentEnum::OpenAI(agent))
@@ -213,6 +214,7 @@ impl Agent {
             "anthropic" => {
                 let agent = llm::create_anthropic_agent_builder(config)?
                     .preamble(preamble)
+                    .default_max_turns(config.max_turns as usize)
                     .tools(tools)
                     .build();
                 Ok(RigAgentEnum::Anthropic(agent))
@@ -220,6 +222,7 @@ impl Agent {
             "gemini" => {
                 let agent = llm::create_gemini_agent_builder(config)?
                     .preamble(preamble)
+                    .default_max_turns(config.max_turns as usize)
                     .tools(tools)
                     .build();
                 Ok(RigAgentEnum::Gemini(agent))
@@ -233,6 +236,7 @@ impl Agent {
                 llm::ensure_mlx_server(base_url, &config.model).await?;
                 let agent = llm::create_local_agent_builder(base_url, &config.model)?
                     .preamble(preamble)
+                    .default_max_turns(config.max_turns as usize)
                     .tools(tools)
                     .build();
                 Ok(RigAgentEnum::Local(agent))

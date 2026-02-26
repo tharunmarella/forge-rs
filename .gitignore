@@ -1,8 +1,37 @@
-/target
-npm/bin/
+# Rust
 target/
-reference-repos/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+*.profraw
+*.profdata
+
+# Build artifacts
+dist/
+build/
+
+# Config & logs
+.env
+*.log
+forge_ide.log
+
+# Session data
 .forge/
 
-models/
-test_embeddings.py
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS
+Thumbs.db
