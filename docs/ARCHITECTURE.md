@@ -52,11 +52,11 @@ flowchart TB
     end
 
     subgraph Tools["tools"]
-        execute["execute_command"]
+        execute["run"]
         files["files\n(read, write, replace, patch, list, delete)"]
-        search["search\n(grep, glob, codebase_search)"]
+        search["search\n(grep, glob, search)"]
         code["code\n(LSP + tree-sitter: definitions, refs)"]
-        web["web\n(search, fetch, fetch_documentation)"]
+        web["web\n(search, fetch, docs)"]
         embeddings["embeddings + embeddings_store"]
         lint["lint / diagnostics"]
         ide["ide (apply_patch via EditAgent)"]
@@ -93,7 +93,7 @@ flowchart TB
 | **Agent** | Holds config, workdir, context, repo_map, doc_prefetcher, messages, session. Builds system prompt (repo map + optional prefetched docs). Loop: `get_completion_streaming()` → text or tool_calls → execute tools → append results → repeat. |
 | **Context** | **Context**: walk workdir, collect file list + line counts + language. **RepoMap**: tree-sitter tags → file graph → PageRank → fit within token budget. **DocPrefetcher**: background Context7 API search/fetch, cache, inject into next turn. |
 | **API** | **streaming**: SSE/stream handling. **gemini**, **anthropic**, **openai**: provider-specific request/response and function-calling. Agent chooses provider from config. |
-| **Tools** | File ops, search (grep/glob/semantic), code (LSP + tree-sitter), web (search/fetch/docs), execute_command, embeddings store, diagnostics. Tool results go back into the conversation. |
+| **Tools** | File ops, search (grep/glob/semantic), code (LSP + tree-sitter), web (search/fetch/docs), run, embeddings store, diagnostics. Tool results go back into the conversation. |
 | **edit_agent** | Specialized edit generation (whole-file, search-replace, unified-diff). Used by tools (e.g. ide/apply_patch) for reliable code edits. |
 
 ## Data flow (single turn)

@@ -393,7 +393,7 @@ pub async fn delete(args: &Value, workdir: &Path) -> ToolResult {
         
         if entry_count > 10 {
             return ToolResult::err(format!(
-                "Directory has {} entries. Use execute_command with 'rm -rf' for large deletions.",
+                "Directory has {} entries. Use run with 'rm -rf' for large deletions.",
                 entry_count
             ));
         }

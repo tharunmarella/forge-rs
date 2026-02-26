@@ -94,12 +94,12 @@ pub enum Tool {
 impl Tool {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::ExecuteCommand => "execute_command",
-            Self::ReadFile => "read_file",
-            Self::WriteToFile => "write_to_file",
-            Self::ReplaceInFile => "replace_in_file",
+            Self::ExecuteCommand => "run",
+            Self::ReadFile => "read",
+            Self::WriteToFile => "write",
+            Self::ReplaceInFile => "replace",
             Self::ApplyPatch => "apply_patch",
-            Self::ListFiles => "list_files",
+            Self::ListFiles => "ls",
             Self::DeleteFile => "delete_file",
             // Background processes & ports
             Self::ExecuteBackground => "execute_background",
@@ -111,7 +111,7 @@ impl Tool {
             Self::KillPort => "kill_port",
             Self::Grep => "grep",
             Self::Glob => "glob",
-            Self::CodebaseSearch => "codebase_search",
+            Self::CodebaseSearch => "search",
             Self::IndexFiles => "index_files",
             Self::ReindexWorkspace => "reindex_workspace",
             Self::WatchFiles => "watch_files",
@@ -120,12 +120,12 @@ impl Tool {
             Self::ListTraces => "list_traces",
             Self::GetTrace => "get_trace",
             Self::TraceDashboard => "trace_dashboard",
-            Self::GenerateRepoMap => "generate_repo_map",
+            Self::GenerateRepoMap => "repomap",
             Self::ListCodeDefinitions => "list_code_definition_names",
             Self::GetSymbolDefinition => "get_symbol_definition",
             Self::FindSymbolReferences => "find_symbol_references",
             Self::Diagnostics => "diagnostics",
-            Self::GetArchitectureMap => "get_architecture_map",
+            Self::GetArchitectureMap => "repomap",
             Self::SearchFunctions => "search_functions",
             Self::SearchClasses => "search_classes",
             Self::SearchFiles => "search_files",
@@ -134,7 +134,7 @@ impl Tool {
             Self::LspHover => "lsp_hover",
             Self::WebSearch => "web_search",
             Self::WebFetch => "web_fetch",
-            Self::FetchDocs => "fetch_documentation",
+            Self::FetchDocs => "docs",
             Self::AttemptCompletion => "attempt_completion",
             Self::AskFollowupQuestion => "ask_followup_question",
             Self::Think => "think",
@@ -154,12 +154,12 @@ impl Tool {
 
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
-            "execute_command" => Some(Self::ExecuteCommand),
-            "read_file" => Some(Self::ReadFile),
-            "write_to_file" => Some(Self::WriteToFile),
-            "replace_in_file" => Some(Self::ReplaceInFile),
+            "run" => Some(Self::ExecuteCommand),
+            "read" => Some(Self::ReadFile),
+            "write" => Some(Self::WriteToFile),
+            "replace" => Some(Self::ReplaceInFile),
             "apply_patch" => Some(Self::ApplyPatch),
-            "list_files" => Some(Self::ListFiles),
+            "ls" => Some(Self::ListFiles),
             "delete_file" => Some(Self::DeleteFile),
             // Background processes & ports
             "execute_background" => Some(Self::ExecuteBackground),
@@ -171,7 +171,7 @@ impl Tool {
             "kill_port" => Some(Self::KillPort),
             "grep" => Some(Self::Grep),
             "glob" => Some(Self::Glob),
-            "codebase_search" => Some(Self::CodebaseSearch),
+            "search" => Some(Self::CodebaseSearch),
             "index_files" => Some(Self::IndexFiles),
             "reindex_workspace" => Some(Self::ReindexWorkspace),
             "watch_files" => Some(Self::WatchFiles),
@@ -180,14 +180,13 @@ impl Tool {
             "list_traces" => Some(Self::ListTraces),
             "get_trace" => Some(Self::GetTrace),
             "trace_dashboard" => Some(Self::TraceDashboard),
-            "generate_repo_map" => Some(Self::GenerateRepoMap),
+            "repomap" => Some(Self::GenerateRepoMap),
             "list_code_definition_names" => Some(Self::ListCodeDefinitions),
             "get_symbol_definition" => Some(Self::GetSymbolDefinition),
             "find_symbol_references" => Some(Self::FindSymbolReferences),
             "trace_call_chain" => Some(Self::TraceCallChain),
             "impact_analysis" => Some(Self::ImpactAnalysis),
             "diagnostics" => Some(Self::Diagnostics),
-            "get_architecture_map" => Some(Self::GetArchitectureMap),
             "search_functions" => Some(Self::SearchFunctions),
             "search_classes" => Some(Self::SearchClasses),
             "search_files" => Some(Self::SearchFiles),
@@ -197,7 +196,7 @@ impl Tool {
             "replan" => Some(Self::Replan),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
-            "fetch_documentation" => Some(Self::FetchDocs),
+            "docs" => Some(Self::FetchDocs),
             "attempt_completion" => Some(Self::AttemptCompletion),
             "ask_followup_question" => Some(Self::AskFollowupQuestion),
             "think" => Some(Self::Think),
@@ -521,7 +520,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         // Essential tools
         serde_json::json!({
-            "name": "execute_command",
+            "name": "run",
             "description": "Execute a shell command. Use for running builds, tests, git, etc.",
             "parameters": {
                 "type": "object",
@@ -532,7 +531,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "read_file",
+            "name": "read",
             "description": "Read the contents of a file",
             "parameters": {
                 "type": "object",
@@ -545,7 +544,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "write_to_file",
+            "name": "write",
             "description": "Create a new file with the given content",
             "parameters": {
                 "type": "object",
@@ -557,7 +556,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "replace_in_file",
+            "name": "replace",
             "description": "Replace text in a file. old_str must match exactly.",
             "parameters": {
                 "type": "object",
@@ -582,7 +581,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "list_files",
+            "name": "ls",
             "description": "List files in a directory",
             "parameters": {
                 "type": "object",
@@ -689,7 +688,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
         }),
         // SEARCH TOOLS - order matters for model selection
         serde_json::json!({
-            "name": "codebase_search",
+            "name": "search",
             "description": "SEMANTIC/CONCEPTUAL search - find code by meaning. Use for understanding ('how does X work'), finding related code ('authentication logic'), or exploring unfamiliar areas. This is the PRIMARY search tool.",
             "parameters": {
                 "type": "object",
@@ -826,7 +825,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "fetch_documentation",
+            "name": "docs",
             "description": "Fetch official library/framework documentation from Context7. PREFERRED over web_search for programming libraries. Use when you need API details, usage patterns, or aren't familiar with a library.",
             "parameters": {
                 "type": "object",
@@ -861,7 +860,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
         }),
         // Architecture & search
         serde_json::json!({
-            "name": "get_architecture_map",
+            "name": "repomap",
             "description": "Get a hierarchical map of the codebase: key files, symbols, and their locations. Use this first to understand project structure before diving into code.",
             "parameters": {
                 "type": "object",
@@ -1040,7 +1039,7 @@ pub fn definitions(plan_mode: bool) -> Vec<Value> {
     if plan_mode {
         tools.retain(|t| {
             let name = t["name"].as_str().unwrap_or("");
-            !matches!(name, "execute_command" | "write_to_file" | "replace_in_file" | "apply_patch" | "execute_background" | "kill_process" | "kill_port")
+            !matches!(name, "run" | "write" | "replace" | "apply_patch" | "execute_background" | "kill_process" | "kill_port")
         });
     }
 

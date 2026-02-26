@@ -516,7 +516,7 @@ pub async fn index_files(args: &Value, workdir: &Path) -> ToolResult {
         provider_config.as_ref().cloned()
     };
     let Some(provider) = provider else {
-        return ToolResult::err("No embedding provider configured. Run codebase_search first to initialize.");
+        return ToolResult::err("No embedding provider configured. Run search first to initialize.");
     };
 
     // Open embedding database
@@ -592,7 +592,7 @@ pub async fn reindex_workspace(args: &Value, workdir: &Path) -> ToolResult {
         provider_config.as_ref().cloned()
     };
     let Some(provider) = provider else {
-        return ToolResult::err("No embedding provider configured. Run codebase_search first to initialize.");
+        return ToolResult::err("No embedding provider configured. Run search first to initialize.");
     };
 
     // Clear existing embeddings

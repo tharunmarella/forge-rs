@@ -130,7 +130,7 @@ impl Agent {
         // Planner agent (has search and planning tools)
         let mut search_tools = Vec::new();
         for t in self.create_rig_tools() {
-            if ["codebase_search", "grep", "read_file", "list_files", "get_architecture_map", "list_code_definition_names", "search_functions", "search_classes",
+            if ["search", "grep", "read", "ls", "repomap", "list_code_definition_names", "search_functions", "search_classes",
                 "create_plan", "update_plan", "add_plan_step", "remove_plan_step", "replan", "discard_plan"].contains(&t.name().as_str()) {
                 search_tools.push(t);
             }
@@ -333,7 +333,7 @@ impl Agent {
         let explore_prompt = format!(
             "You are in the EXPLORE phase. Your goal is to gather context to solve the user's task.\n\
              Task: {prompt}\n\n\
-             Use codebase_search, grep, and other search tools to understand the relevant code and architecture. \n\
+             Use search, grep, and other search tools to understand the relevant code and architecture. \n\
              When you have a good understanding, provide a summary of your findings and what needs to be changed."
         );
         let explore_results = self.agent_chat("planner", &explore_prompt, vec![]).await?;

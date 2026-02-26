@@ -139,11 +139,11 @@ impl Default for ModelsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoApproveConfig {
-    /// Auto-approve read operations (read_file, list_files, search_files, etc.)
+    /// Auto-approve read operations (read, ls, search_files, etc.)
     #[serde(default = "default_true")]
     pub read_operations: bool,
     
-    /// Auto-approve write operations (write_to_file, replace_in_file)
+    /// Auto-approve write operations (write, replace)
     #[serde(default)]
     pub write_operations: bool,
     
@@ -338,9 +338,9 @@ impl Config {
         // Category-based approval
         match tool_name {
             // Read operations
-            "read_file" | "list_files" | "codebase_search" 
+            "read" | "ls" | "search" 
             | "list_code_definition_names" | "get_symbol_definition" 
-            | "find_symbol_references" | "web_search" | "web_fetch" | "fetch_documentation"
+            | "find_symbol_references" | "web_search" | "web_fetch" | "docs"
             | "grep" | "glob" | "diagnostics" | "check_process_status" | "read_process_output"
             | "check_port" | "trace_call_chain" | "impact_analysis" | "scan_files"
             | "list_traces" | "get_trace" | "trace_dashboard" | "generate_repo_map" => {
@@ -348,14 +348,14 @@ impl Config {
             }
             
             // Write operations
-            "write_to_file" | "replace_in_file" | "apply_patch" | "delete_file"
+            "write" | "replace" | "apply_patch" | "delete_file"
             | "kill_process" | "kill_port" | "index_files" | "reindex_workspace" 
             | "watch_files" | "stop_watching" => {
                 self.auto_approve.write_operations
             }
             
             // Commands
-            "execute_command" | "execute_background" | "wait_for_port" => {
+            "run" | "execute_background" | "wait_for_port" => {
                 self.auto_approve.commands
             }
             

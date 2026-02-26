@@ -47,11 +47,11 @@ flowchart TB
     end
 
     subgraph Tools["tools"]
-        execute["execute_command"]
+        execute["run"]
         files["files: read write replace patch list delete"]
-        search["search: grep glob codebase_search"]
+        search["search: grep glob search"]
         code["code: LSP + tree-sitter defs refs"]
-        web["web: search fetch fetch_documentation"]
+        web["web: search fetch docs"]
         embeddings["embeddings + embeddings_store"]
         lint["lint / diagnostics"]
         ide["ide apply_patch via EditAgent"]
